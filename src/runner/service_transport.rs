@@ -240,7 +240,9 @@ async fn readiness_unix_attempt(
     // Poll the maintained HTTP driver and request together. Dropping this joined
     // future on the outer deadline cancels connect, headers, body and driver as
     // one bounded operation; no detached task can keep service shutdown waiting.
-    let (driver, response) = tokio::join!(connection, request);
+    // A completed response may already have disconnected its peer on Darwin;
+    // readiness must not depend on a redundant write shutdown succeeding.
+    let (driver, response) = tokio::join!(connection.without_shutdown(), request);
     if driver.is_err() && response.as_ref().is_ok_and(|ready| *ready) {
         return Ok(false);
     }
@@ -352,6 +354,77 @@ pub(super) fn remove_owned_unix_endpoint(
         (Some(_), None) => {
             Err("refusing to remove a service engine endpoint that was never authenticated".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{readiness_unix, UnixReadiness, UNIX_READINESS_ATTEMPT_TIMEOUT};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn readiness_after_peer_close(body: &str, content_length: usize) -> Result<bool, String> {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("engine.sock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::UnixListener::bind(&endpoint).unwrap()
+        };
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+        );
+        let server = runtime.spawn(async move {
+            tokio::time::timeout(UNIX_READINESS_ATTEMPT_TIMEOUT, async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let mut read = 0;
+                while !request[..read].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    assert!(read < request.len(), "readiness request exceeded its bound");
+                    let received = stream.read(&mut request[read..]).await.unwrap();
+                    assert_ne!(received, 0, "readiness closed before sending its request");
+                    read += received;
+                }
+                assert!(request[..read].starts_with(b"GET /v1/models HTTP/1.1\r\n"));
+                stream.write_all(response.as_bytes()).await.unwrap();
+                drop(stream);
+            })
+            .await
+            .expect("stand-in readiness exchange exceeded its deadline");
+        });
+        let poll = readiness_unix(
+            runtime.handle(),
+            &endpoint,
+            "demo",
+            std::process::id(),
+            &|| None,
+        );
+        runtime.block_on(server).unwrap();
+        assert!(
+            poll.endpoint_identity.is_some(),
+            "readiness did not authenticate its peer"
+        );
+        poll.outcome
+            .map(|outcome| matches!(outcome, UnixReadiness::Ready))
+    }
+
+    #[test]
+    fn complete_response_is_ready_after_the_authenticated_peer_closes() {
+        let body = r#"{"data":[{"id":"demo"}]}"#;
+        assert!(readiness_after_peer_close(body, body.len()).unwrap());
+    }
+
+    #[test]
+    fn malformed_or_truncated_response_is_not_ready_after_peer_close() {
+        let malformed = "invalid JSON";
+        assert!(!readiness_after_peer_close(malformed, malformed.len()).unwrap_or(false));
+        let valid = r#"{"data":[{"id":"demo"}]}"#;
+        assert!(!readiness_after_peer_close(valid, valid.len() + 1).unwrap_or(false));
     }
 }
 
