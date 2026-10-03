@@ -238,8 +238,10 @@ fn service_lock_owner_child() {
         || false,
     )
     .unwrap();
-    let PersistentStart::Ready(server) = started else {
-        panic!("stand-in service engine did not reach readiness")
+    let server = match started {
+        PersistentStart::Ready(server) => server,
+        PersistentStart::Stopped(exit) => panic!("stand-in service engine exited: {exit:?}"),
+        _ => panic!("stand-in service engine did not reach readiness"),
     };
     fs::write(root.join("owner-ready"), b"ready").unwrap();
     std::hint::black_box((&ownership, &server));
@@ -248,17 +250,18 @@ fn service_lock_owner_child() {
     }
 }
 
-fn wait_for_file(path: &Path, owner: &mut std::process::Child) {
+fn wait_for_file(path: &Path, owner: &mut std::process::Child, prelease: bool, fallback: bool) {
     let deadline = Instant::now() + Duration::from_secs(8);
     while !path.is_file() {
+        let status = owner.try_wait().unwrap();
         assert!(
-            owner.try_wait().unwrap().is_none(),
-            "service owner exited before {}",
+            status.is_none(),
+            "service owner exited with {status:?} before {} (prelease={prelease}, fallback={fallback})",
             path.display()
         );
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {}",
+            "timed out waiting for {} (prelease={prelease}, fallback={fallback})",
             path.display()
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -360,7 +363,7 @@ fn service_child_retains_cross_version_and_model_exclusion_after_owner_death() {
             ])
             .env(ROOT_ENV, &root)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         if fallback {
             command.env(FALLBACK_ENV, "1");
         }
@@ -376,7 +379,12 @@ fn service_child_retains_cross_version_and_model_exclusion_after_owner_death() {
             owner,
             cleanup_attempted: false,
         };
-        wait_for_file(&root.join("owner-ready"), &mut fixture.owner);
+        wait_for_file(
+            &root.join("owner-ready"),
+            &mut fixture.owner,
+            prelease,
+            fallback,
+        );
         if !prelease {
             fixture.owner.kill().unwrap();
         }
