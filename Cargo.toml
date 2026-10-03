@@ -52,3 +52,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 members = ["crates/loxa-diagnostics", "crates/loxa-ipc", "loxa-app/src-tauri"]
 default-members = ["."]
 resolver = "2"
+
+[profile.dev.package."sha2:0.11.0"]
+opt-level = 3

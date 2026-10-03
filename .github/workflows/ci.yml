@@ -94,6 +94,7 @@ jobs:
             printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
             printf 'binary_bytes=%s\n' "$(stat -c %s "${LOXA_TEST_BINARY}")"
             printf 'cpu_count=%s\n' "$(nproc)"
+            LC_ALL=C lscpu | sed -n '/^Model name:/p'
             rustc --version
             /usr/bin/time --version
           } > "${profile_dir}/metadata.txt"
