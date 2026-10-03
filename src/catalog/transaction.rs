@@ -381,31 +381,39 @@ pub(crate) fn cleanup_completed_bundle_debris(
 }
 
 pub(crate) fn removable_bundle_debris(path: &Path, name: &str, complete: &Manifest) -> bool {
-    if !is_complete_bundle(complete) {
-        return false;
-    }
-    let Some(kind) = bundle_debris_kind(name) else {
+    let Some(kind) = bundle_debris_kind(name, complete) else {
         return false;
     };
     let Some(existing) = read_regular_manifest(path).ok().flatten() else {
         return false;
     };
+    removable_bundle_debris_manifest(kind, &existing, complete)
+}
+
+pub(super) fn removable_bundle_debris_manifest(
+    kind: BundleDebris,
+    existing: &Manifest,
+    complete: &Manifest,
+) -> bool {
     match kind {
-        BundleDebris::Pending | BundleDebris::PendingTemp => existing == *complete,
+        BundleDebris::Pending | BundleDebris::PendingTemp => existing == complete,
         BundleDebris::PredecessorTemp => {
-            existing == *complete || compatible_predecessor(&existing, complete)
+            existing == complete || compatible_predecessor(existing, complete)
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BundleDebris {
+pub(super) enum BundleDebris {
     Pending,
     PendingTemp,
     PredecessorTemp,
 }
 
-fn bundle_debris_kind(name: &str) -> Option<BundleDebris> {
+pub(super) fn bundle_debris_kind(name: &str, complete: &Manifest) -> Option<BundleDebris> {
+    if !is_complete_bundle(complete) {
+        return None;
+    }
     if name == "bundle.pending.json" {
         return Some(BundleDebris::Pending);
     }
