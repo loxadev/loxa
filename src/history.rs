@@ -65,6 +65,7 @@ pub(crate) enum HistoryErrorKind {
 pub(crate) struct HistoryError {
     kind: HistoryErrorKind,
     context: String,
+    native_sqlite_corruption: bool,
 }
 
 impl HistoryError {
@@ -72,6 +73,7 @@ impl HistoryError {
         Self {
             kind,
             context: context.into(),
+            native_sqlite_corruption: false,
         }
     }
 
@@ -81,6 +83,12 @@ impl HistoryError {
 
     pub(crate) fn context(&self) -> &str {
         &self.context
+    }
+
+    fn remap(mut self, kind: HistoryErrorKind, context: impl Into<String>) -> Self {
+        self.kind = kind;
+        self.context = context.into();
+        self
     }
 }
 
@@ -215,6 +223,17 @@ enum HistoryCommand {
     #[cfg(test)]
     SetProgressInterval {
         instructions: i32,
+        ready: SyncSender<()>,
+    },
+    #[cfg(test)]
+    ObserveSqlError {
+        error: rusqlite::Error,
+        during_commit: bool,
+        reply: oneshot::Sender<HistoryError>,
+    },
+    #[cfg(test)]
+    SetNextPurgeError {
+        error: HistoryError,
         ready: SyncSender<()>,
     },
 }
@@ -772,6 +791,33 @@ impl HistoryHandle {
         received
             .recv()
             .expect("history owner must install the progress hook");
+    }
+
+    #[cfg(test)]
+    async fn observe_sql_error(&self, error: rusqlite::Error, during_commit: bool) -> HistoryError {
+        let (reply, received) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::ObserveSqlError {
+                error,
+                during_commit,
+                reply,
+            })
+            .expect("history error observation must fit the bounded queue");
+        tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("history error observation timed out")
+            .expect("history owner must observe the error")
+    }
+
+    #[cfg(test)]
+    fn set_next_purge_error(&self, error: HistoryError) {
+        let (ready, received) = mpsc::sync_channel(0);
+        self.commands
+            .try_send(HistoryCommand::SetNextPurgeError { error, ready })
+            .expect("history purge fault must fit the bounded queue");
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("history owner must install the purge fault");
     }
 
     #[cfg(test)]

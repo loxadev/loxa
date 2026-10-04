@@ -21,6 +21,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 mod reopen;
+mod sqlite_health;
 
 fn private_root(label: &str) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::Builder::new()
@@ -535,8 +536,10 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
             model_id: "demo".into(),
         },
         Some(initial_default.clone()),
+        purge::delete_batch,
     )
     .unwrap()
+    .0
     {
         HistoryReply::Conversation(conversation) => conversation,
         _ => panic!("create returned the wrong history reply"),

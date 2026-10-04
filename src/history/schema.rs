@@ -88,6 +88,11 @@ pub(super) fn open_store(
         .map_err(classify_sql_error)
         .map_err(StoreOpenError::before_open)?;
     let opened = (|| {
+        // This connection-local check must precede every database-reading query.
+        connection
+            .execute_batch("PRAGMA cell_size_check = ON;")
+            .map_err(classify_sql_error)?;
+        verify_integer_pragma(&connection, "cell_size_check", 1)?;
         install_progress_handler(&connection, 1000, interrupted, interrupt_on_drain)?;
         apply_limits(&mut connection)?;
         apply_preflight_settings(&connection)?;
@@ -391,8 +396,8 @@ fn verify_schema(connection: &Connection, version: i64) -> Result<(), HistoryErr
                     created_ms, updated_ms, revision, profile_revision, deleted
              FROM conversations WHERE 0",
         )
-        .map_err(|_| {
-            HistoryError::new(
+        .map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing required conversation fields",
             )
@@ -523,8 +528,8 @@ fn verify_v2_fields(connection: &Connection) -> Result<(), HistoryError> {
         "SELECT id, desktop_client_id, conversation_id, revision, consumed_revision,
                 text, text_hash, updated_ms FROM drafts WHERE 0",
     ] {
-        connection.prepare(query).map_err(|_| {
-            HistoryError::new(
+        connection.prepare(query).map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing required schema-2 fields",
             )
@@ -538,8 +543,8 @@ fn verify_v3_fields(connection: &Connection) -> Result<(), HistoryError> {
         "SELECT attempt_id, start_offset, end_offset, content FROM attempt_chunks WHERE 0",
         "SELECT attempt_id, start_offset, end_offset FROM attempt_finalizations WHERE 0",
     ] {
-        connection.prepare(query).map_err(|_| {
-            HistoryError::new(
+        connection.prepare(query).map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing required schema-3 fields",
             )
@@ -557,8 +562,8 @@ fn verify_v4_fields(connection: &Connection) -> Result<(), HistoryError> {
                     stop_reason
              FROM attempt_statistics WHERE 0",
         )
-        .map_err(|_| {
-            HistoryError::new(
+        .map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing required schema-4 fields",
             )
@@ -571,8 +576,8 @@ fn verify_v5_fields(connection: &Connection) -> Result<(), HistoryError> {
         "SELECT conversation_id, temperature, top_p FROM conversation_sampling WHERE 0",
         "SELECT attempt_id, temperature, top_p FROM attempt_sampling WHERE 0",
     ] {
-        connection.prepare(query).map_err(|_| {
-            HistoryError::new(
+        connection.prepare(query).map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing required schema-5 fields",
             )
@@ -613,8 +618,8 @@ fn schema_sql(
             [kind, name],
             |row| row.get(0),
         )
-        .map_err(|_| {
-            HistoryError::new(
+        .map_err(|error| {
+            classify_sql_error(error).remap(
                 HistoryErrorKind::Corrupt,
                 "history schema is missing a required definition",
             )
@@ -807,6 +812,11 @@ fn unsafe_path(context: impl Into<String>) -> HistoryError {
 }
 
 pub(super) fn classify_sql_error(error: rusqlite::Error) -> HistoryError {
+    let native_sqlite_corruption = matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    );
     let kind = match &error {
         rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => HistoryErrorKind::Busy,
@@ -819,7 +829,15 @@ pub(super) fn classify_sql_error(error: rusqlite::Error) -> HistoryError {
         rusqlite::Error::FromSqlConversionFailure(_, _, _) => HistoryErrorKind::Corrupt,
         _ => HistoryErrorKind::Io,
     };
-    HistoryError::new(kind, "history database operation failed")
+    let mut classified = HistoryError::new(kind, "history database operation failed");
+    classified.native_sqlite_corruption = native_sqlite_corruption;
+    classified
+}
+
+pub(super) fn classify_commit_error(error: rusqlite::Error, context: &'static str) -> HistoryError {
+    // Commit certainty and native connection health are independent. A transient
+    // uncertain outcome can still reconcile on this connection; corruption cannot.
+    classify_sql_error(error).remap(HistoryErrorKind::OutcomeUnknown, context)
 }
 
 #[cfg(test)]

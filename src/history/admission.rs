@@ -318,11 +318,8 @@ fn admit(
         barrier.wait();
         barrier.wait();
     }
-    transaction.commit().map_err(|_| {
-        HistoryError::new(
-            HistoryErrorKind::OutcomeUnknown,
-            "history admission commit outcome is unknown",
-        )
+    transaction.commit().map_err(|error| {
+        schema::classify_commit_error(error, "history admission commit outcome is unknown")
     })?;
     Ok(CommittedAdmission {
         conversation_id: prepared.conversation_id,

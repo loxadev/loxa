@@ -131,11 +131,8 @@ pub(super) fn append_suffix(
     if changed != 1 {
         return Err(conflict("attempt changed during suffix persistence"));
     }
-    transaction.commit().map_err(|_| {
-        HistoryError::new(
-            HistoryErrorKind::OutcomeUnknown,
-            "history suffix commit outcome is unknown",
-        )
+    transaction.commit().map_err(|error| {
+        schema::classify_commit_error(error, "history suffix commit outcome is unknown")
     })?;
     Ok(SuffixCommit {
         start: input.expected_saved_end,
@@ -211,11 +208,8 @@ pub(super) fn finalize(
     if changed != 1 {
         return Err(conflict("attempt changed during finalization"));
     }
-    transaction.commit().map_err(|_| {
-        HistoryError::new(
-            HistoryErrorKind::OutcomeUnknown,
-            "history finalization commit outcome is unknown",
-        )
+    transaction.commit().map_err(|error| {
+        schema::classify_commit_error(error, "history finalization commit outcome is unknown")
     })?;
     Ok(SuffixCommit {
         start: input.suffix.expected_saved_end,

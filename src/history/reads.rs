@@ -143,7 +143,10 @@ pub(super) fn list_turns(
         .saturating_mul(std::mem::size_of::<TurnSummary>());
     let mut has_more = false;
     while let Some(row) = rows.next().map_err(schema::classify_sql_error)? {
-        let turn = turn_row(row).map_err(|_| corrupt("stored turn metadata is invalid"))?;
+        let turn = turn_row(row).map_err(|error| {
+            schema::classify_sql_error(error)
+                .remap(HistoryErrorKind::Corrupt, "stored turn metadata is invalid")
+        })?;
         if turns.len() == usize::from(limit) {
             has_more = true;
             break;
