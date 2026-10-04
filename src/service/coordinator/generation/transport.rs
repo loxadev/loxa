@@ -286,6 +286,10 @@ mod tests {
                     role: PromptRole::Assistant,
                     content: "hi".into(),
                 },
+                PromptMessage {
+                    role: PromptRole::User,
+                    content: "next café 你好 👋".into(),
+                },
             ],
         };
         let encoded = PreparedEngineRequest::new(
@@ -298,9 +302,15 @@ mod tests {
         .unwrap()
         .body;
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["messages"][0]["role"], "system");
-        assert_eq!(value["messages"][1]["content"], "hello");
-        assert_eq!(value["messages"][2]["role"], "assistant");
+        assert_eq!(
+            value["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "next café 你好 👋"},
+            ])
+        );
         assert_eq!(value["max_completion_tokens"], 512);
         assert_eq!(value["stream"], true);
         assert_eq!(value["temperature"], 0.0);

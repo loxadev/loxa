@@ -135,7 +135,8 @@ async fn qualify_engine(
     let observation_id = super::qualification_fixture::record_preflight(
         runtime_identity.build(),
         &reservation.fingerprint,
-        qualification.template_sha256,
+        &props.chat_template,
+        &request.body,
         qualification.actual_context,
         counted.input_tokens,
         prompt.max_output_tokens,

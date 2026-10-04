@@ -1,4 +1,3 @@
-use super::MODEL_ID;
 use loxa_ipc::{
     AttemptExecution, AttemptSave, ClientError, ConnectMode, ContentSource, DraftCommand,
     DraftReply, DraftSnapshot, ErrorCategory, GenerationAccepted, GenerationCommand,
@@ -19,13 +18,15 @@ pub(super) struct Conversation {
 
 pub(super) async fn create_conversation(
     client: &ServiceClient,
+    model_id: &str,
     max_output_tokens: u32,
+    system_instruction: Option<&str>,
 ) -> Result<Conversation, String> {
     let conversation = match client
         .history_request(
             ConnectMode::ObserveExisting,
             HistoryCommand::CreateConversation {
-                model_id: MODEL_ID.into(),
+                model_id: model_id.into(),
             },
         )
         .await
@@ -42,7 +43,7 @@ pub(super) async fn create_conversation(
                 expected_conversation_revision: conversation.revision,
                 expected_profile_revision: conversation.profile_revision,
                 patch: GenerationSettingsPatch::Fields {
-                    system_instruction: None,
+                    system_instruction: system_instruction.map(str::to_owned),
                     max_output_tokens: Some(max_output_tokens),
                     temperature: Some(OptionalSamplingValuePatch::Set {
                         value: SamplingValue::new(super::super::qualification_fixture::TEMPERATURE)
@@ -66,6 +67,50 @@ pub(super) async fn create_conversation(
         revision: profile.conversation_revision,
         profile_revision: profile.profile_revision,
     })
+}
+
+impl Conversation {
+    pub(super) fn after(&self, accepted: &GenerationAccepted) -> Result<Self, String> {
+        if accepted.conversation_id != self.id {
+            return Err("native admission belongs to another conversation".into());
+        }
+        Ok(Self {
+            id: self.id.clone(),
+            revision: accepted.post_conversation_revision.clone(),
+            profile_revision: accepted.profile_revision.clone(),
+        })
+    }
+}
+
+pub(super) async fn reserve_full_context(
+    client: &ServiceClient,
+    conversation: Conversation,
+) -> Result<Conversation, String> {
+    match client
+        .settings_request(
+            ConnectMode::ObserveExisting,
+            ServiceSettingsCommand::PatchConversationProfile {
+                conversation_id: conversation.id,
+                expected_conversation_revision: conversation.revision,
+                expected_profile_revision: conversation.profile_revision,
+                patch: GenerationSettingsPatch::Fields {
+                    system_instruction: None,
+                    max_output_tokens: Some(super::CONTEXT_TOKENS),
+                    temperature: None,
+                    top_p: None,
+                },
+            },
+        )
+        .await
+        .map_err(client_error)?
+    {
+        ServiceSettingsReply::Conversation(profile) => Ok(Conversation {
+            id: profile.conversation_id,
+            revision: profile.conversation_revision,
+            profile_revision: profile.profile_revision,
+        }),
+        _ => Err("native output reservation patch returned the wrong reply".into()),
+    }
 }
 
 pub(super) async fn create_draft(

@@ -336,6 +336,27 @@ fn bundled_generation_preflight_usage_quiescence_and_stop() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a finalized built app and the advertised SmolLM2 Q4_K_M artifact"]
+fn advertised_smollm2_q4_generation_counts_full_history_and_stop() {
+    let _process = process_test_lock();
+    let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+    let model = PathBuf::from(std::env::var_os("LOXA_ADVERTISED_SMOL_MODEL").unwrap());
+    let evidence = PathBuf::from(std::env::var_os("LOXA_SMOL_EVIDENCE").unwrap());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = runtime
+        .block_on(crate::service::run_advertised_smollm2_acceptance(
+            &app, &model, &evidence,
+        ))
+        .unwrap();
+    println!("LOXA_ADVERTISED_SMOL_QUALIFICATION={report}");
+}
+
 #[cfg(unix)]
 static RUN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

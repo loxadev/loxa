@@ -1,4 +1,4 @@
-use super::{MODEL_ID, MODEL_SHA256, MODEL_SIZE};
+use crate::catalog::Manifest;
 use crate::paths::AppPaths;
 use crate::service::coordinator::Coordinator;
 use loxa_ipc::{ConnectMode, ReplyOutcome, RuntimePhase, ServiceClient, ServiceCommand};
@@ -17,10 +17,12 @@ pub(super) struct NativeService {
     pub(super) coordinator: Coordinator,
     pub(super) client: ServiceClient,
     pub(super) runtime_evidence: NativeRuntimeEvidence,
+    pub(super) model: Manifest,
     server: Option<tokio::task::JoinHandle<Result<(), String>>>,
     stop_requested: bool,
 }
 
+#[derive(serde::Serialize)]
 pub(super) struct NativeRuntimeEvidence {
     pub(super) build: String,
     pub(super) commit: String,
@@ -117,7 +119,16 @@ impl NativeEngine {
 
 impl NativeService {
     pub(super) async fn start(app: &Path, source_model: &Path) -> Result<Self, String> {
-        crate::verification::file::verify_regular(source_model, MODEL_SIZE, MODEL_SHA256)?;
+        Self::start_with_manifest(app, source_model, super::qualification_fixture::manifest()).await
+    }
+
+    pub(super) async fn start_with_manifest(
+        app: &Path,
+        source_model: &Path,
+        model: Manifest,
+    ) -> Result<Self, String> {
+        model.validate()?;
+        crate::verification::file::verify_regular(source_model, model.size, &model.sha256)?;
         let directory = tempfile::Builder::new()
             .prefix(FIXTURE_TEMP_PREFIX)
             .tempdir_in("/private/tmp")
@@ -150,7 +161,7 @@ impl NativeService {
         models
             .create(&paths.models)
             .map_err(|error| error.to_string())?;
-        install_model(&paths.models, source_model)?;
+        install_model(&paths.models, source_model, &model)?;
         let client = ServiceClient::load(&root, None, crate::service::BUILD_ID)?;
         let (machine_boot_id, boot_epoch) =
             crate::service::intent::boot_evidence(bootstrap.root().root_identity())?;
@@ -182,6 +193,7 @@ impl NativeService {
             coordinator,
             client,
             runtime_evidence,
+            model,
             server: Some(server),
             stop_requested: false,
         };
@@ -190,7 +202,7 @@ impl NativeService {
                 .wait_for_socket(bootstrap.root().socket_path())
                 .await?;
             wait_for_history(&fixture.client).await?;
-            load_model(&fixture.client).await
+            load_model(&fixture.client, &fixture.model.id).await
         }
         .await;
         if let Err(error) = initialization {
@@ -385,9 +397,8 @@ fn inspect_bundled_runtime(paths: &AppPaths) -> Result<NativeRuntimeEvidence, St
     })
 }
 
-fn install_model(models: &Path, source_model: &Path) -> Result<(), String> {
-    let manifest = super::super::qualification_fixture::manifest();
-    let model_dir = models.join(MODEL_ID);
+fn install_model(models: &Path, source_model: &Path, manifest: &Manifest) -> Result<(), String> {
+    let model_dir = models.join(&manifest.id);
     let mut directory = fs::DirBuilder::new();
     directory.mode(0o700);
     directory
@@ -395,7 +406,7 @@ fn install_model(models: &Path, source_model: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let model_lock = crate::catalog::ModelLock::acquire(&model_dir)?;
     fs::copy(source_model, model_dir.join("model.gguf")).map_err(|error| error.to_string())?;
-    crate::catalog::publish_manifest(models, &manifest)?;
+    crate::catalog::publish_manifest(models, manifest)?;
     drop(model_lock);
     Ok(())
 }
@@ -417,12 +428,12 @@ async fn wait_for_history(client: &ServiceClient) -> Result<(), String> {
     }
 }
 
-pub(super) async fn load_model(client: &ServiceClient) -> Result<(), String> {
+pub(super) async fn load_model(client: &ServiceClient, expected_model: &str) -> Result<(), String> {
     let accepted = match client
         .request(
             ConnectMode::ObserveExisting,
             ServiceCommand::Load {
-                model_id: MODEL_ID.into(),
+                model_id: expected_model.into(),
             },
         )
         .await
@@ -442,7 +453,7 @@ pub(super) async fn load_model(client: &ServiceClient) -> Result<(), String> {
                 ..
             } if task_id == accepted.task_id
                 && generation == accepted.generation
-                && model_id == MODEL_ID =>
+                && model_id == expected_model =>
             {
                 return Ok(())
             }

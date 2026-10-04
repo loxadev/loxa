@@ -26,7 +26,9 @@ pub(in crate::service::coordinator) use relay::{run_for_test, stream_for_test, S
 mod transport;
 
 #[cfg(all(test, target_os = "macos"))]
-pub(in crate::service) use native_acceptance::run_bundled_generation_acceptance;
+pub(in crate::service) use native_acceptance::{
+    run_advertised_smollm2_acceptance, run_bundled_generation_acceptance,
+};
 
 impl Coordinator {
     pub(in crate::service) async fn generation_request(

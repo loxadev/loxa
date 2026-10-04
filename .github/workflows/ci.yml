@@ -133,3 +133,90 @@ jobs:
           cargo test --locked --workspace --lib --bins \
             runnable::tests::legacy_provenance_under_bundled_app_selects_and_reports_active_b10344_without_rewrite \
             -- --exact --ignored
+      - name: Qualify advertised SmolLM2 Q4 with bundled runtime
+        id: qualify_smollm2
+        timeout-minutes: 10
+        shell: bash
+        env:
+          LOXA_BUILT_APP: ${{ github.workspace }}/target/release/bundle/macos/Loxa.app
+          LOXA_ADVERTISED_SMOL_MODEL: ${{ runner.temp }}/loxa-smollm2-135m-q4-k-m.gguf
+        run: |
+          set -euo pipefail
+          LOXA_SMOL_EVIDENCE="$(mktemp -d "${RUNNER_TEMP}/loxa-smollm2-q4-qualification.XXXXXX")"
+          export LOXA_SMOL_EVIDENCE
+          printf 'evidence_dir=%s\n' "${LOXA_SMOL_EVIDENCE}" >> "${GITHUB_OUTPUT}"
+          trap 'rm -f "${LOXA_ADVERTISED_SMOL_MODEL}"' EXIT
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import platform
+
+          metadata = {
+              "commit": os.environ["GITHUB_SHA"],
+              "runner_image": os.environ.get("ImageOS", "unknown"),
+              "runner_image_version": os.environ.get("ImageVersion", "unknown"),
+              "architecture": platform.machine(),
+          }
+          output = Path(os.environ["LOXA_SMOL_EVIDENCE"]) / "runner.json"
+          output.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+          PY
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 120 \
+            --retry 2 --retry-delay 2 --retry-all-errors --retry-max-time 180 \
+            --output "${LOXA_ADVERTISED_SMOL_MODEL}" \
+            'https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/09816acd5d99df7be770d85ea30822623dab342c/SmolLM2-135M-Instruct-Q4_K_M.gguf'
+          test "$(stat -f '%z' "${LOXA_ADVERTISED_SMOL_MODEL}")" = '105454432'
+          test "$(shasum -a 256 "${LOXA_ADVERTISED_SMOL_MODEL}" | awk '{print $1}')" = \
+            '2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d'
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import time
+
+          output = Path(os.environ["LOXA_SMOL_EVIDENCE"])
+          test_name = "runner::tests::advertised_smollm2_q4_generation_counts_full_history_and_stop"
+          started = time.monotonic()
+          with (output / "acceptance.log").open("w", encoding="utf-8") as log:
+              process = subprocess.Popen(
+                  ["cargo", "test", "--locked", "--workspace", "--lib", "--bins", test_name,
+                   "--", "--exact", "--ignored", "--test-threads=1", "--nocapture"],
+                  cwd=os.environ["GITHUB_WORKSPACE"], stdout=log, stderr=subprocess.STDOUT,
+                  start_new_session=True,
+              )
+              try:
+                  outcome = {"exit_code": process.wait(timeout=240), "timed_out": False}
+              except subprocess.TimeoutExpired:
+                  try:
+                      os.killpg(process.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  process.wait(timeout=10)
+                  # Engine processes have their own groups; runner timeout cleanup is unknown.
+                  outcome = {"exit_code": process.returncode, "timed_out": True, "cleanup": "unknown"}
+          outcome["elapsed_seconds"] = time.monotonic() - started
+          (output / "outcome.json").write_text(json.dumps(outcome, indent=2) + "\n", encoding="utf-8")
+          print((output / "acceptance.log").read_text(encoding="utf-8")[-16384:])
+          if outcome["timed_out"] or outcome["exit_code"] != 0:
+              raise SystemExit("advertised Smol native acceptance failed; retained evidence is incomplete")
+          report_path = output / "qualification.json"
+          if not report_path.is_file() or report_path.stat().st_size > 256 * 1024:
+              raise SystemExit("native acceptance did not generate a fresh bounded qualification report")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if (
+              not isinstance(report, dict)
+              or report.get("status") != "candidate_passed"
+              or report.get("exact_final_engine_cleanup") is not True
+          ):
+              raise SystemExit("fresh native qualification report did not establish success and exact cleanup")
+          PY
+      - name: Upload advertised SmolLM2 qualification evidence
+        if: ${{ always() && steps.qualify_smollm2.outcome != 'skipped' && steps.qualify_smollm2.outputs.evidence_dir != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-smollm2-q4-qualification
+          path: ${{ steps.qualify_smollm2.outputs.evidence_dir }}/
+          if-no-files-found: warn

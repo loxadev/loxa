@@ -21,7 +21,9 @@ mod history;
 #[cfg(all(test, target_os = "macos"))]
 mod native_test_gate;
 #[cfg(all(test, target_os = "macos"))]
-pub(in crate::service) use generation::run_bundled_generation_acceptance;
+pub(in crate::service) use generation::{
+    run_advertised_smollm2_acceptance, run_bundled_generation_acceptance,
+};
 
 pub(super) struct PendingGenerationConnection {
     coordinator: Coordinator,

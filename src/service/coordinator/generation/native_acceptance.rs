@@ -1,3 +1,4 @@
+mod advertised_smollm2;
 mod client;
 mod evidence;
 mod harness;
@@ -19,7 +20,8 @@ use loxa_ipc::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub(super) use qualification_fixture::{CONTEXT_TOKENS, MODEL_ID, MODEL_SHA256, MODEL_SIZE};
+pub(in crate::service) use advertised_smollm2::run_advertised_smollm2_acceptance;
+pub(super) use qualification_fixture::CONTEXT_TOKENS;
 const GENERATION_TOKENS: u32 = 2;
 
 pub(in crate::service) async fn run_bundled_generation_acceptance(
@@ -42,8 +44,10 @@ pub(in crate::service) async fn run_bundled_generation_acceptance(
 
 async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     let prompt: &'static str = "Reply with the English word hello. Input: café 你好 👋.";
-    let first = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
-    let busy = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
+    let first =
+        create_conversation(&fixture.client, &fixture.model.id, GENERATION_TOKENS, None).await?;
+    let busy =
+        create_conversation(&fixture.client, &fixture.model.id, GENERATION_TOKENS, None).await?;
     let busy_draft = create_draft(&fixture.client, &busy, "busy draft remains exact").await?;
 
     // The SQLite worker has returned the commit and released its permit at
@@ -141,7 +145,8 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         );
     }
 
-    let overflow = create_conversation(&fixture.client, CONTEXT_TOKENS).await?;
+    let overflow =
+        create_conversation(&fixture.client, &fixture.model.id, CONTEXT_TOKENS, None).await?;
     let overflow_draft =
         create_draft(&fixture.client, &overflow, "overflow draft remains exact").await?;
     let overflow_result = send(
@@ -246,7 +251,7 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     if endpoint.exists() {
         return Err("stopped exact engine endpoint survived verified cleanup".into());
     }
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     stop_after_content_and_reject_stale_target(fixture, prompt).await?;
     exercise_reload_lifecycle(fixture).await?;
 
@@ -320,7 +325,7 @@ async fn exercise_reload_lifecycle(fixture: &mut NativeService) -> Result<(), St
         .recv_timeout(std::time::Duration::from_secs(1))
         .map_err(|_| "runtime owner did not consume the queue probe".to_string())?;
 
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     let old = ready_target(&fixture.client).await?;
     let engine = NativeEngine::capture(fixture)?;
     fixture.coordinator.fail_next_native_runtime_termination();
@@ -339,7 +344,7 @@ async fn exercise_reload_lifecycle(fixture: &mut NativeService) -> Result<(), St
     wait_for_unloaded(&fixture.client).await?;
     engine.require_removed()?;
 
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     let old = ready_target(&fixture.client).await?;
     let engine = NativeEngine::capture(fixture)?;
     fixture.coordinator.fail_next_native_intent_clear();
@@ -363,7 +368,7 @@ async fn exercise_reload_lifecycle(fixture: &mut NativeService) -> Result<(), St
     unload(&fixture.client, accepted_target(&clear_successor)).await?;
     wait_for_unloaded(&fixture.client).await?;
 
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     let old = ready_target(&fixture.client).await?;
     let successor = fixture
         .client
@@ -406,7 +411,7 @@ async fn exercise_reload_lifecycle(fixture: &mut NativeService) -> Result<(), St
     wait_for_unloaded(&fixture.client).await?;
     require_no_launch_artifacts(fixture)?;
 
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     let old = ready_target(&fixture.client).await?;
     let engine = NativeEngine::capture(fixture)?;
     let mut launch = fixture.coordinator.pause_native_reload_launch();
@@ -576,7 +581,8 @@ async fn stop_after_content_and_reject_stale_target(
     fixture: &NativeService,
     prompt: &str,
 ) -> Result<(), String> {
-    let stopped = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
+    let stopped =
+        create_conversation(&fixture.client, &fixture.model.id, GENERATION_TOKENS, None).await?;
     let engine = NativeEngine::capture(fixture)?;
     let mut output = fixture.coordinator.pause_native_generation_output();
     let accepted = send(fixture.client.clone(), stopped.clone(), prompt, None, 6)
@@ -645,9 +651,10 @@ async fn stop_after_content_and_reject_stale_target(
     engine.require_removed()?;
     fixture.wait_for_admission_release().await?;
 
-    load_model(&fixture.client).await?;
+    load_model(&fixture.client, &fixture.model.id).await?;
     let replacement_engine = NativeEngine::capture(fixture)?;
-    let replacement = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
+    let replacement =
+        create_conversation(&fixture.client, &fixture.model.id, GENERATION_TOKENS, None).await?;
     let mut execution = fixture.coordinator.pause_native_generation_execution();
     let replacement_accepted = send(fixture.client.clone(), replacement.clone(), prompt, None, 7)
         .await

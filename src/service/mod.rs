@@ -22,6 +22,15 @@ pub(crate) async fn run_bundled_generation_acceptance(
     coordinator::run_bundled_generation_acceptance(app, model).await
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) async fn run_advertised_smollm2_acceptance(
+    app: &Path,
+    model: &Path,
+    evidence: &Path,
+) -> Result<String, String> {
+    coordinator::run_advertised_smollm2_acceptance(app, model, evidence).await
+}
+
 pub enum HiddenServiceResult {
     NotServiceCommand,
     Exit(Result<i32, String>),

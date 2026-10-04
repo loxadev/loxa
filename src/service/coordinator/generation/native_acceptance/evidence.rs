@@ -1,5 +1,5 @@
 use super::harness::NativeRuntimeEvidence;
-use super::{CONTEXT_TOKENS, MODEL_ID, MODEL_SHA256, MODEL_SIZE};
+use super::CONTEXT_TOKENS;
 use crate::runtime_identity::RuntimeIdentity;
 use crate::service::coordinator::generation::qualification_fixture::PreflightObservation;
 use serde_json::json;
@@ -14,46 +14,13 @@ pub(super) fn validate(
             observations.len()
         ));
     };
-    let expected_runtime = RuntimeIdentity::BundledB10344;
-    if runtime.build != expected_runtime.build()
-        || runtime.commit != crate::runtime_bundle::bundled_commit()
-        || runtime.version_line != expected_runtime.version_line()
-        || !is_lower_hex_digest(&runtime.server_sha256)
-        || !is_lower_hex_digest(&runtime.inventory_sha256)
-        || runtime.server_size == 0
-    {
-        return Err("native generation inspected the wrong bundled runtime".into());
-    }
-    for observation in observations {
-        if observation.runtime_build != runtime.build
-            || observation.model_id != MODEL_ID
-            || observation.primary_sha256 != MODEL_SHA256
-            || observation.primary_size != MODEL_SIZE
-            || observation.actual_context != CONTEXT_TOKENS
-            || !is_lower_hex_digest(&observation.template_sha256)
-        {
-            return Err("native generation recorded the wrong exact qualification basis".into());
-        }
-    }
-    if observations
-        .iter()
-        .any(|observation| observation.template_sha256 != first.template_sha256)
-    {
-        return Err("native generation template basis changed between preflights".into());
-    }
+    validate_basis(
+        observations,
+        runtime,
+        &super::qualification_fixture::manifest(),
+    )?;
     for observation in [first, cached, replacement] {
-        if !observation.postcommit_gate_entered
-            || observation.generation_dispatches != 1
-            || !observation.basis_carried_to_execution
-            || observation.generated_end == 0
-            || observation.completion_prompt_tokens != Some(observation.input_tokens)
-            || observation
-                .completion_cached_tokens
-                .is_some_and(|cached| cached > observation.input_tokens)
-            || !observation.quiescent_after_terminal
-        {
-            return Err("native completion did not preserve count, basis, or idle evidence".into());
-        }
+        validate_completion(observation)?;
     }
     if first.input_tokens != retry.input_tokens || first.input_tokens != cached.input_tokens {
         return Err("identical UTF-8 prompts changed token counts after cache reuse".into());
@@ -83,6 +50,76 @@ pub(super) fn validate(
     {
         return Err("native Retry Stop crossed the engine request boundary".into());
     }
+    validate_output_stop(output_stop)
+}
+
+pub(super) fn validate_basis(
+    observations: &[PreflightObservation],
+    runtime: &NativeRuntimeEvidence,
+    model: &crate::catalog::Manifest,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    let first = observations
+        .first()
+        .ok_or_else(|| "native generation recorded no preflights".to_string())?;
+    let expected_runtime = RuntimeIdentity::BundledB10344;
+    if runtime.build != expected_runtime.build()
+        || runtime.commit != crate::runtime_bundle::bundled_commit()
+        || runtime.version_line != expected_runtime.version_line()
+        || !is_lower_hex_digest(&runtime.server_sha256)
+        || !is_lower_hex_digest(&runtime.inventory_sha256)
+        || runtime.server_size == 0
+    {
+        return Err("native generation inspected the wrong bundled runtime".into());
+    }
+    for observation in observations {
+        if observation.runtime_build != runtime.build
+            || observation.model_id != model.id
+            || observation.primary_sha256 != model.sha256
+            || observation.primary_size != model.size
+            || observation.actual_context != CONTEXT_TOKENS
+            || observation.template.is_empty()
+            || observation.template.len() > 64 * 1024
+            || observation.request_body.len() > 64 * 1024
+            || observation.template_sha256
+                != super::qualification_fixture::encode_digest(
+                    Sha256::digest(observation.template.as_bytes()).into(),
+                )
+            || observation.request_sha256
+                != super::qualification_fixture::encode_digest(
+                    Sha256::digest(observation.request_body.as_bytes()).into(),
+                )
+        {
+            return Err("native generation recorded the wrong exact qualification basis".into());
+        }
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.template_sha256 != first.template_sha256)
+    {
+        return Err("native generation template basis changed between preflights".into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_completion(observation: &PreflightObservation) -> Result<(), String> {
+    if !observation.postcommit_gate_entered
+        || observation.generation_dispatches != 1
+        || !observation.basis_carried_to_execution
+        || observation.generated_end == 0
+        || observation.completion_prompt_tokens != Some(observation.input_tokens)
+        || observation
+            .completion_cached_tokens
+            .is_some_and(|cached| cached > observation.input_tokens)
+        || !observation.quiescent_after_terminal
+    {
+        return Err("native completion did not preserve count, basis, or idle evidence".into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_output_stop(output_stop: &PreflightObservation) -> Result<(), String> {
     let prefix = output_stop
         .output_gate_prefix
         .as_ref()

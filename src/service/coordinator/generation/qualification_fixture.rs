@@ -6,6 +6,13 @@ pub(super) const MODEL_ID: &str = "loxa-generation-fixture";
 pub(super) const MODEL_SHA256: &str =
     "741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9";
 pub(super) const MODEL_SIZE: u64 = 88_202_080;
+#[cfg(target_os = "macos")]
+const ADVERTISED_MODEL_ID: &str = "smollm2-135m";
+#[cfg(target_os = "macos")]
+const ADVERTISED_MODEL_SHA256: &str =
+    "2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d";
+#[cfg(target_os = "macos")]
+const ADVERTISED_MODEL_SIZE: u64 = 105_454_432;
 pub(super) const CONTEXT_TOKENS: u32 = 4096;
 #[cfg(target_os = "macos")]
 pub(super) const TEMPERATURE: f64 = 0.0;
@@ -15,6 +22,19 @@ pub(super) const TOP_P: f64 = 0.95;
 #[cfg(target_os = "macos")]
 pub(super) fn manifest() -> Manifest {
     manifest_with_sha(MODEL_SHA256)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn advertised_smollm2_manifest() -> Manifest {
+    let mut manifest = manifest();
+    manifest.id = ADVERTISED_MODEL_ID.into();
+    manifest.remote_filename = Some("SmolLM2-135M-Instruct-Q4_K_M.gguf".into());
+    manifest.sha256 = ADVERTISED_MODEL_SHA256.into();
+    manifest.size = ADVERTISED_MODEL_SIZE;
+    manifest
+        .validate()
+        .expect("advertised Smol fixture is valid");
+    manifest
 }
 
 fn manifest_with_sha(sha256: &str) -> Manifest {
@@ -44,17 +64,23 @@ pub(super) fn template_digest(
     fingerprint: &RuntimeFingerprint,
     template: &[u8],
 ) -> Option<[u8; 32]> {
-    (fingerprint.model_id() == MODEL_ID
-        && fingerprint.effective_profile() == EffectiveProfile::Generic
+    let exact_model = fingerprint.model_id() == MODEL_ID
         && fingerprint.primary_sha256() == MODEL_SHA256
-        && fingerprint.primary_size() == MODEL_SIZE
+        && fingerprint.primary_size() == MODEL_SIZE;
+    #[cfg(target_os = "macos")]
+    let exact_model = exact_model
+        || (fingerprint.model_id() == ADVERTISED_MODEL_ID
+            && fingerprint.primary_sha256() == ADVERTISED_MODEL_SHA256
+            && fingerprint.primary_size() == ADVERTISED_MODEL_SIZE);
+    (exact_model
+        && fingerprint.effective_profile() == EffectiveProfile::Generic
         && fingerprint.draft_sha256().is_none()
         && fingerprint.draft_size().is_none())
     .then(|| Sha256::digest(template).into())
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(super) struct PreflightObservation {
     pub(super) id: u64,
     pub(super) runtime_build: String,
@@ -62,6 +88,11 @@ pub(super) struct PreflightObservation {
     pub(super) primary_sha256: String,
     pub(super) primary_size: u64,
     pub(super) template_sha256: String,
+    #[serde(skip)]
+    pub(super) template: String,
+    pub(super) request_sha256: String,
+    #[serde(skip)]
+    pub(super) request_body: String,
     pub(super) actual_context: u32,
     pub(super) input_tokens: u32,
     pub(super) max_output_tokens: u32,
@@ -81,7 +112,7 @@ pub(super) struct PreflightObservation {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(super) struct OutputPrefix {
     pub(super) bytes: usize,
     pub(super) sha256: String,
@@ -99,13 +130,19 @@ static OBSERVATIONS: std::sync::LazyLock<std::sync::Mutex<Vec<PreflightObservati
 pub(super) fn record_preflight(
     runtime_build: &str,
     fingerprint: &RuntimeFingerprint,
-    template_sha256: [u8; 32],
+    template: &str,
+    request_body: &[u8],
     actual_context: u32,
     input_tokens: u32,
     max_output_tokens: i64,
 ) -> Option<u64> {
     use std::sync::atomic::Ordering;
 
+    // Only bounded synthetic fixture requests are retained in native test evidence.
+    if template.len() > 64 * 1024 || request_body.len() > 64 * 1024 {
+        return None;
+    }
+    let request_body = std::str::from_utf8(request_body).ok()?;
     let max_output_tokens = u32::try_from(max_output_tokens).ok()?;
     let mut observations = OBSERVATIONS
         .lock()
@@ -120,7 +157,10 @@ pub(super) fn record_preflight(
         model_id: fingerprint.model_id().into(),
         primary_sha256: fingerprint.primary_sha256().into(),
         primary_size: fingerprint.primary_size(),
-        template_sha256: encode_digest(template_sha256),
+        template_sha256: encode_digest(Sha256::digest(template.as_bytes()).into()),
+        template: template.into(),
+        request_sha256: encode_digest(Sha256::digest(request_body.as_bytes()).into()),
+        request_body: request_body.into(),
         actual_context,
         input_tokens,
         max_output_tokens,
