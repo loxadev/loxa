@@ -204,13 +204,13 @@ impl ApiRuntimeHost {
         model_id: &str,
         cancellation: &ApiStartCancellation,
     ) -> Result<ApiStartOutcome, ApiStartError> {
-        self.start_inner(model_id, cancellation, || {}, || {})
+        self.start_inner(model_id, &|| cancellation.is_cancelled(), || {}, || {})
     }
 
     fn start_inner(
         &mut self,
         model_id: &str,
-        cancellation: &ApiStartCancellation,
+        cancelled: &impl Fn() -> bool,
         after_admission: impl FnOnce(),
         after_ready: impl FnOnce(),
     ) -> Result<ApiStartOutcome, ApiStartError> {
@@ -224,7 +224,7 @@ impl ApiRuntimeHost {
                 Err(ApiStartError::Conflict)
             };
         }
-        if cancellation.is_cancelled() {
+        if cancelled() {
             return Err(ApiStartError::Cancelled);
         }
         let manifest = crate::catalog::load_catalog(&self.paths.models)
@@ -236,20 +236,18 @@ impl ApiRuntimeHost {
             manifest,
             &self.paths,
             self.prepared_runtime.clone(),
-            &|| cancellation.is_cancelled(),
+            cancelled,
         )
         .map_err(|error| self.map_preparation_error(error))?;
         if self.paths.runtime_identity.is_bundled() {
             self.prepared_runtime = runnable.managed_runtime().cloned();
         }
         after_admission();
-        if cancellation.is_cancelled() {
+        if cancelled() {
             return Err(ApiStartError::Cancelled);
         }
-        let started = crate::runner::start_persistent(runnable, &self.paths.run, || {
-            cancellation.is_cancelled()
-        })
-        .map_err(Self::map_start_error)?;
+        let started = crate::runner::start_persistent(runnable, &self.paths.run, cancelled)
+            .map_err(Self::map_start_error)?;
         let mut runtime = match started {
             PersistentStart::Ready(runtime) => runtime,
             PersistentStart::Stopped(_exit) => return Err(ApiStartError::StartupFailed),
@@ -262,7 +260,7 @@ impl ApiRuntimeHost {
             }
         };
         after_ready();
-        if cancellation.is_cancelled() {
+        if cancelled() {
             if self.terminate_runtime(&mut runtime).is_err() {
                 self.runtime = Some(runtime);
                 return Err(ApiStartError::StartupFailed);
@@ -350,7 +348,12 @@ impl ApiRuntimeHost {
         after_admission: impl FnOnce(),
         after_ready: impl FnOnce(),
     ) -> Result<ApiStartOutcome, ApiStartError> {
-        self.start_inner(model_id, cancellation, after_admission, after_ready)
+        self.start_inner(
+            model_id,
+            &|| cancellation.is_cancelled(),
+            after_admission,
+            after_ready,
+        )
     }
 }
 

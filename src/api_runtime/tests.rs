@@ -812,7 +812,7 @@ fn cancellation_during_first_verification_is_typed_and_never_spawns_or_publishes
     let fixture = InstalledFixture::new();
     let model_dir = fixture.model_dir("demo");
     let artifact = model_dir.join("model.gguf");
-    let mut bytes = vec![0x5a; 16 * 1024 * 1024];
+    let mut bytes = vec![0x5a; 3 * 64 * 1024];
     bytes[..8].copy_from_slice(b"GGUF\x03\0\0\0");
     let digest = Sha256::digest(&bytes)
         .iter()
@@ -831,18 +831,28 @@ fn cancellation_during_first_verification_is_typed_and_never_spawns_or_publishes
     let receipt = model_dir.join("verification-receipt.json");
     fs::write(&receipt, b"stale").unwrap();
     let cancellation = ApiStartCancellation::new();
-    let canceller = cancellation.clone();
-    let receipt_for_canceller = receipt.clone();
-    let waiter = thread::spawn(move || {
-        wait_for(Duration::from_secs(5), || !receipt_for_canceller.exists());
-        canceller.cancel();
-    });
+    let verification_polls = Cell::new(0_usize);
     let mut host = ApiRuntimeHost::new(fixture.paths.clone());
 
-    let result = host.start("demo", &cancellation);
-    waiter.join().unwrap();
+    let result = host.start_inner(
+        "demo",
+        &|| {
+            if !receipt.exists() {
+                let next = verification_polls.get() + 1;
+                verification_polls.set(next);
+                // The second hash-loop poll interrupts after the first 64 KiB chunk.
+                if next == 2 {
+                    cancellation.cancel();
+                }
+            }
+            cancellation.is_cancelled()
+        },
+        || panic!("cancelled verification reached admission"),
+        || {},
+    );
 
     assert_eq!(result, Err(ApiStartError::Cancelled));
+    assert_eq!(verification_polls.get(), 2);
     assert_eq!(host.endpoint(), None);
     assert_eq!(fixture.launch_count(), 0);
     assert!(
