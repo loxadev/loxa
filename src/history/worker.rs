@@ -1,7 +1,8 @@
 use super::{
-    admission, conversations, drafts, schema, AdmissionCompletion, AdmissionKind, DraftCompletion,
-    HistoryCommand, HistoryCompletion, HistoryErrorKind, HistoryExit, HistoryHandle,
-    ProfileCompletion, RequiredCompletion, SuffixCompletion,
+    admission, conversations, drafts, prompt, reads, schema, AdmissionCompletion, AdmissionKind,
+    AttemptCompletion, DraftCompletion, HistoryCommand, HistoryCompletion, HistoryError,
+    HistoryErrorKind, HistoryExit, HistoryHandle, ProfileCompletion, PromptCompletion,
+    SuffixCompletion,
 };
 use loxa_ipc::HistoryStatus;
 use std::collections::VecDeque;
@@ -71,7 +72,7 @@ pub(super) fn run(
     #[cfg(test)]
     let mut drop_next_persistence_reply = false;
     #[cfg(test)]
-    let mut fail_next_stop_before_execution = false;
+    let mut next_purge_error: Option<HistoryError> = None;
     let mut pending = VecDeque::with_capacity(super::COMMAND_CAPACITY);
     loop {
         match next_command(&receiver, &mut pending) {
@@ -82,6 +83,22 @@ pub(super) fn run(
                 permit,
             }) => {
                 interrupt_on_drain.store(true, Ordering::Release);
+                #[cfg(test)]
+                let purge_error = if matches!(
+                    &operation,
+                    loxa_ipc::HistoryCommand::DeleteConversation { .. }
+                ) {
+                    next_purge_error.take()
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                let purge = |store: &mut rusqlite::Connection| match purge_error {
+                    Some(error) => Err(error),
+                    None => super::purge::delete_batch(store),
+                };
+                #[cfg(not(test))]
+                let purge = super::purge::delete_batch;
                 let result = match connection.as_mut() {
                     Some(WorkerStore::Ready(store)) => conversations::execute_with_generation(
                         store,
@@ -89,12 +106,18 @@ pub(super) fn run(
                         runtime_identity,
                         operation,
                         generation,
+                        purge,
                     ),
                     Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
                         HistoryErrorKind::WorkerUnavailable,
                         "history store is unavailable",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
+                let result = result.map(|(reply, purge_error)| {
+                    retire_observed_corruption(&mut connection, &handle, purge_error.as_ref());
+                    reply
+                });
                 let _ = reply.send(HistoryCompletion { result, permit });
             }
             Ok(HistoryCommand::ExecuteProfile {
@@ -113,7 +136,26 @@ pub(super) fn run(
                         "history store is unavailable",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 let _ = reply.send(ProfileCompletion { result, permit });
+            }
+            Ok(HistoryCommand::ReadObservedAttempt {
+                observation,
+                reply,
+                permit,
+            }) => {
+                interrupt_on_drain.store(true, Ordering::Release);
+                let result = match connection.as_ref() {
+                    Some(WorkerStore::Ready(store)) => {
+                        reads::get_observed_attempt(store, &observation)
+                    }
+                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
+                        HistoryErrorKind::WorkerUnavailable,
+                        "history store is unavailable",
+                    )),
+                };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
+                let _ = reply.send(AttemptCompletion { result, permit });
             }
             Ok(HistoryCommand::Drain) => match connection.take() {
                 #[cfg(test)]
@@ -156,7 +198,33 @@ pub(super) fn run(
                         "history store is unavailable",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 let _ = reply.send(DraftCompletion { result, permit });
+            }
+            Ok(HistoryCommand::PreparePrompt {
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                request,
+                reply,
+                permit,
+            }) => {
+                interrupt_on_drain.store(true, Ordering::Release);
+                let result = match connection.as_ref() {
+                    Some(WorkerStore::Ready(store)) => prompt::prepare(
+                        store,
+                        conversation_id,
+                        expected_conversation_revision,
+                        expected_profile_revision,
+                        request,
+                    ),
+                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
+                        HistoryErrorKind::WorkerUnavailable,
+                        "history store is unavailable",
+                    )),
+                };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
+                let _ = reply.send(PromptCompletion { result, permit });
             }
             Ok(HistoryCommand::LookupSubmission {
                 submission_id,
@@ -174,6 +242,7 @@ pub(super) fn run(
                         "history store is unavailable",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 let _ = reply.send(result);
                 drop(permit);
             }
@@ -193,6 +262,7 @@ pub(super) fn run(
                         "history owner cannot reconcile the admission",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 let _ = reply.send(result);
                 drop(permit);
             }
@@ -230,6 +300,7 @@ pub(super) fn run(
                         "history owner cannot determine the admission outcome",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 #[cfg(test)]
                 if drop_next_admission_reply {
                     drop_next_admission_reply = false;
@@ -240,42 +311,6 @@ pub(super) fn run(
                 }
                 #[cfg(not(test))]
                 let _ = reply.send(AdmissionCompletion { result, permit });
-            }
-            Ok(HistoryCommand::StopBeforeExecution {
-                committed,
-                reply,
-                permit,
-            }) => {
-                interrupt_on_drain.store(false, Ordering::Release);
-                #[cfg(test)]
-                let result = if fail_next_stop_before_execution {
-                    fail_next_stop_before_execution = false;
-                    Err(super::HistoryError::new(
-                        HistoryErrorKind::Io,
-                        "injected cancelled-admission save failure",
-                    ))
-                } else {
-                    match connection.as_ref() {
-                        Some(WorkerStore::Ready(store)) => {
-                            admission::stop_before_execution(store, &committed)
-                        }
-                        Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                            HistoryErrorKind::OutcomeUnknown,
-                            "history owner cannot save cancelled admission",
-                        )),
-                    }
-                };
-                #[cfg(not(test))]
-                let result = match connection.as_ref() {
-                    Some(WorkerStore::Ready(store)) => {
-                        admission::stop_before_execution(store, &committed)
-                    }
-                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                        HistoryErrorKind::OutcomeUnknown,
-                        "history owner cannot save cancelled admission",
-                    )),
-                };
-                let _ = reply.send(RequiredCompletion { result, permit });
             }
             Ok(HistoryCommand::AppendSuffix {
                 input,
@@ -290,6 +325,7 @@ pub(super) fn run(
                         "history owner cannot determine the suffix outcome",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 drop(input);
                 #[cfg(test)]
                 if drop_next_persistence_reply {
@@ -315,6 +351,7 @@ pub(super) fn run(
                         "history owner cannot determine the finalization outcome",
                     )),
                 };
+                retire_observed_corruption(&mut connection, &handle, result.as_ref().err());
                 drop(input);
                 #[cfg(test)]
                 if drop_next_persistence_reply {
@@ -350,23 +387,37 @@ pub(super) fn run(
                 let _ = ready.send(());
             }
             #[cfg(test)]
-            Ok(HistoryCommand::FailNextStopBeforeExecution(ready)) => {
-                fail_next_stop_before_execution = true;
-                let _ = ready.send(());
-            }
-            #[cfg(test)]
             Ok(HistoryCommand::SetProgressInterval {
                 instructions,
                 ready,
             }) => {
-                if let Some(store) = connection.as_ref() {
+                if let Some(WorkerStore::Ready(store)) = connection.as_ref() {
                     let _ = schema::install_progress_handler(
-                        store.connection(),
+                        store,
                         instructions,
                         handle.draining.clone(),
                         Arc::clone(&interrupt_on_drain),
                     );
                 }
+                let _ = ready.send(());
+            }
+            #[cfg(test)]
+            Ok(HistoryCommand::ObserveSqlError {
+                error,
+                during_commit,
+                reply,
+            }) => {
+                let error = if during_commit {
+                    schema::classify_commit_error(error, "injected commit outcome is unknown")
+                } else {
+                    schema::classify_sql_error(error)
+                };
+                retire_observed_corruption(&mut connection, &handle, Some(&error));
+                let _ = reply.send(error);
+            }
+            #[cfg(test)]
+            Ok(HistoryCommand::SetNextPurgeError { error, ready }) => {
+                next_purge_error = Some(error);
                 let _ = ready.send(());
             }
             Err(RecvError) => {
@@ -380,6 +431,24 @@ pub(super) fn run(
             }
         }
     }
+}
+
+fn retire_observed_corruption(
+    connection: &mut Option<WorkerStore>,
+    handle: &HistoryHandle,
+    error: Option<&HistoryError>,
+) {
+    if !error.is_some_and(|error| error.native_sqlite_corruption) {
+        return;
+    }
+    // Retirement prevents more database operations but keeps the connection in
+    // this owner until the existing explicit Drain/close lifecycle completes.
+    *connection = connection
+        .take()
+        .map(|store| WorkerStore::Unavailable(store.into_connection()));
+    handle.status.send_replace(HistoryStatus::unavailable(
+        "native SQLite corruption detected; history connection is retired",
+    ));
 }
 
 fn next_command(
@@ -406,7 +475,6 @@ fn is_required(command: &HistoryCommand) -> bool {
         command,
         HistoryCommand::Admit { .. }
             | HistoryCommand::ReconcileSubmission { .. }
-            | HistoryCommand::StopBeforeExecution { .. }
             | HistoryCommand::AppendSuffix { .. }
             | HistoryCommand::Finalize { .. }
     )
@@ -418,13 +486,6 @@ enum WorkerStore {
 }
 
 impl WorkerStore {
-    #[cfg(test)]
-    fn connection(&self) -> &rusqlite::Connection {
-        match self {
-            Self::Ready(connection) | Self::Unavailable(connection) => connection,
-        }
-    }
-
     fn into_connection(self) -> rusqlite::Connection {
         match self {
             Self::Ready(connection) | Self::Unavailable(connection) => connection,

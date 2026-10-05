@@ -156,13 +156,15 @@ where
     }
     let launch_started = Instant::now();
     let child_ownership = ownership.reserve_child()?;
+    let common_lock = child_ownership.duplicate_common_lock_for_service_child()?;
+    let model_lock = runnable.duplicate_model_lock_for_service_child()?;
     let started = OwnedServer::start_with_service_ownership(
         runnable.launch(),
         runnable.fingerprint(),
         endpoint,
         runtime_handle,
         STARTUP_TIMEOUT,
-        child_ownership,
+        (child_ownership, common_lock, model_lock),
         &cancelled,
     )?;
     match started {
@@ -187,13 +189,15 @@ where
                 attempt = 2_u8
             );
             let child_ownership = ownership.reserve_child()?;
+            let common_lock = child_ownership.duplicate_common_lock_for_service_child()?;
+            let model_lock = runnable.duplicate_model_lock_for_service_child()?;
             match OwnedServer::start_with_service_ownership(
                 runnable.launch(),
                 runnable.fingerprint(),
                 endpoint,
                 runtime_handle,
                 STARTUP_TIMEOUT,
-                child_ownership,
+                (child_ownership, common_lock, model_lock),
                 &cancelled,
             )? {
                 StartOutcome::Ready(server) => {

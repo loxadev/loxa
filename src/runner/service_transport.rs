@@ -4,13 +4,116 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use std::cell::Cell;
+use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
 const UNIX_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_READINESS_HEADERS: usize = 64;
 const MAX_READINESS_HTTP_BUFFER: usize = 64 * 1024;
+const MAX_PROPERTIES_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct Properties {
+    default_generation_settings: DefaultGenerationSettings,
+    total_slots: u32,
+    model_alias: String,
+    endpoint_slots: bool,
+}
+
+#[derive(Deserialize)]
+struct DefaultGenerationSettings {
+    n_ctx: u32,
+}
+
+pub(crate) fn observe_context(
+    runtime: &tokio::runtime::Handle,
+    endpoint: &Path,
+    pid: u32,
+    model_id: &str,
+) -> Option<u32> {
+    let body = runtime
+        .block_on(get_authenticated_bounded(
+            endpoint,
+            pid,
+            "/props",
+            MAX_PROPERTIES_BYTES,
+        ))
+        .ok()??;
+    parse_context(&body, model_id)
+}
+
+fn parse_context(body: &[u8], model_id: &str) -> Option<u32> {
+    let properties: Properties = serde_json::from_slice(body).ok()?;
+    (properties.model_alias == model_id && properties.total_slots == 1 && properties.endpoint_slots)
+        .then_some(properties.default_generation_settings.n_ctx)
+}
+
+async fn get_authenticated_bounded(
+    path: &Path,
+    expected_pid: u32,
+    uri: &'static str,
+    max_body: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    tokio::time::timeout(UNIX_READINESS_ATTEMPT_TIMEOUT, async {
+        let mut authenticated = None;
+        let Some(stream) = connect_authenticated(path, expected_pid, &mut authenticated).await?
+        else {
+            return Ok(None);
+        };
+        let io = TokioIo::new(stream);
+        let mut builder = hyper::client::conn::http1::Builder::new();
+        builder
+            .max_headers(MAX_READINESS_HEADERS)
+            .max_buf_size(MAX_READINESS_HTTP_BUFFER);
+        let (mut sender, connection) = builder
+            .handshake(io)
+            .await
+            .map_err(|error| error.to_string())?;
+        let request = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header(hyper::header::HOST, "localhost")
+            .header(hyper::header::CONNECTION, "close")
+            .body(Empty::<Bytes>::new())
+            .map_err(|error| error.to_string())?;
+        let exchange = async move {
+            let mut response = sender
+                .send_request(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("{uri} returned HTTP {}", response.status()));
+            }
+            if response
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > max_body)
+            {
+                return Err(format!("{uri} response exceeds {max_body} bytes"));
+            }
+            let mut body = Vec::with_capacity(max_body);
+            while let Some(frame) = response.body_mut().frame().await {
+                let frame = frame.map_err(|error| error.to_string())?;
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if body.len().saturating_add(data.len()) > max_body {
+                    return Err(format!("{uri} response exceeds {max_body} bytes"));
+                }
+                body.extend_from_slice(&data);
+            }
+            Ok(body)
+        };
+        let (driver, response) = tokio::join!(connection.without_shutdown(), exchange);
+        driver.map_err(|error| error.to_string())?;
+        response.map(Some)
+    })
+    .await
+    .map_err(|_| format!("{uri} request timed out"))?
+}
 
 pub(super) fn require_absent_unix_endpoint(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
@@ -76,7 +179,7 @@ async fn readiness_unix_attempt(
     path: &Path,
     id: &str,
     expected_pid: u32,
-    authenticated: &Cell<Option<UnixEndpointIdentity>>,
+    authenticated: &mut Option<UnixEndpointIdentity>,
 ) -> Result<bool, String> {
     let Some(stream) = connect_authenticated(path, expected_pid, authenticated).await? else {
         return Ok(false);
@@ -137,7 +240,9 @@ async fn readiness_unix_attempt(
     // Poll the maintained HTTP driver and request together. Dropping this joined
     // future on the outer deadline cancels connect, headers, body and driver as
     // one bounded operation; no detached task can keep service shutdown waiting.
-    let (driver, response) = tokio::join!(connection, request);
+    // A completed response may already have disconnected its peer on Darwin;
+    // readiness must not depend on a redundant write shutdown succeeding.
+    let (driver, response) = tokio::join!(connection.without_shutdown(), request);
     if driver.is_err() && response.as_ref().is_ok_and(|ready| *ready) {
         return Ok(false);
     }
@@ -150,7 +255,7 @@ async fn readiness_unix_attempt(
 pub(crate) async fn connect_authenticated(
     path: &Path,
     expected_pid: u32,
-    authenticated: &Cell<Option<UnixEndpointIdentity>>,
+    authenticated: &mut Option<UnixEndpointIdentity>,
 ) -> Result<Option<tokio::net::UnixStream>, String> {
     let Some(before) = private_unix_endpoint(path)? else {
         return Ok(None);
@@ -179,7 +284,7 @@ pub(crate) async fn connect_authenticated(
     if after != before {
         return Err("service engine endpoint changed during authentication".into());
     }
-    authenticated.set(Some(after));
+    *authenticated = Some(after);
     Ok(Some(stream))
 }
 
@@ -193,14 +298,14 @@ pub(super) fn readiness_unix<F>(
 where
     F: Fn() -> Option<StartupStop>,
 {
-    let authenticated = Cell::new(None);
+    let mut authenticated = None;
     let outcome = runtime.block_on(async {
         tokio::select! {
             biased;
             stop = wait_for_startup_stop(stop) => Ok(UnixReadiness::Stopped(stop)),
             result = tokio::time::timeout(
                 UNIX_READINESS_ATTEMPT_TIMEOUT,
-                readiness_unix_attempt(path, id, expected_pid, &authenticated),
+                readiness_unix_attempt(path, id, expected_pid, &mut authenticated),
             ) => match result {
                 Ok(Ok(true)) => Ok(UnixReadiness::Ready),
                 Ok(Ok(false)) | Err(_) => Ok(UnixReadiness::Pending),
@@ -209,7 +314,7 @@ where
         }
     });
     UnixReadinessPoll {
-        endpoint_identity: authenticated.get(),
+        endpoint_identity: authenticated,
         outcome,
     }
 }
@@ -219,16 +324,16 @@ pub(super) fn authenticate_unix_endpoint(
     path: &Path,
     expected_pid: u32,
 ) -> Result<Option<UnixEndpointIdentity>, String> {
-    let authenticated = Cell::new(None);
+    let mut authenticated = None;
     let result = runtime.block_on(async {
         tokio::time::timeout(
             UNIX_READINESS_ATTEMPT_TIMEOUT,
-            connect_authenticated(path, expected_pid, &authenticated),
+            connect_authenticated(path, expected_pid, &mut authenticated),
         )
         .await
     });
     match result {
-        Ok(Ok(_)) | Err(_) => Ok(authenticated.get()),
+        Ok(Ok(_)) | Err(_) => Ok(authenticated),
         Ok(Err(error)) => Err(error),
     }
 }
@@ -248,6 +353,103 @@ pub(super) fn remove_owned_unix_endpoint(
         }
         (Some(_), None) => {
             Err("refusing to remove a service engine endpoint that was never authenticated".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{readiness_unix, UnixReadiness, UNIX_READINESS_ATTEMPT_TIMEOUT};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn readiness_after_peer_close(body: &str, content_length: usize) -> Result<bool, String> {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("engine.sock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::UnixListener::bind(&endpoint).unwrap()
+        };
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+        );
+        let server = runtime.spawn(async move {
+            tokio::time::timeout(UNIX_READINESS_ATTEMPT_TIMEOUT, async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let mut read = 0;
+                while !request[..read].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    assert!(read < request.len(), "readiness request exceeded its bound");
+                    let received = stream.read(&mut request[read..]).await.unwrap();
+                    assert_ne!(received, 0, "readiness closed before sending its request");
+                    read += received;
+                }
+                assert!(request[..read].starts_with(b"GET /v1/models HTTP/1.1\r\n"));
+                stream.write_all(response.as_bytes()).await.unwrap();
+                drop(stream);
+            })
+            .await
+            .expect("stand-in readiness exchange exceeded its deadline");
+        });
+        let poll = readiness_unix(
+            runtime.handle(),
+            &endpoint,
+            "demo",
+            std::process::id(),
+            &|| None,
+        );
+        runtime.block_on(server).unwrap();
+        assert!(
+            poll.endpoint_identity.is_some(),
+            "readiness did not authenticate its peer"
+        );
+        poll.outcome
+            .map(|outcome| matches!(outcome, UnixReadiness::Ready))
+    }
+
+    #[test]
+    fn complete_response_is_ready_after_the_authenticated_peer_closes() {
+        let body = r#"{"data":[{"id":"demo"}]}"#;
+        assert!(readiness_after_peer_close(body, body.len()).unwrap());
+    }
+
+    #[test]
+    fn malformed_or_truncated_response_is_not_ready_after_peer_close() {
+        let malformed = "invalid JSON";
+        assert!(!readiness_after_peer_close(malformed, malformed.len()).unwrap_or(false));
+        let valid = r#"{"data":[{"id":"demo"}]}"#;
+        assert!(!readiness_after_peer_close(valid, valid.len() + 1).unwrap_or(false));
+    }
+}
+
+#[cfg(test)]
+mod properties_tests {
+    use super::parse_context;
+
+    #[test]
+    fn observation_requires_the_exact_model_and_single_slot_shape() {
+        let valid = br#"{
+            "default_generation_settings":{"n_ctx":8192,"params":{"temperature":0.8}},
+            "total_slots":1,
+            "model_alias":"demo",
+            "endpoint_slots":true,
+            "chat_template":"{{ messages }}"
+        }"#;
+        assert_eq!(parse_context(valid, "demo"), Some(8192));
+        assert_eq!(parse_context(valid, "other"), None);
+
+        for invalid in [
+            br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":2,"model_alias":"demo","endpoint_slots":true}"#.as_slice(),
+            br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":1,"model_alias":"demo","endpoint_slots":false}"#.as_slice(),
+            br#"{"default_generation_settings":{"n_ctx":"large"},"total_slots":1,"model_alias":"demo","endpoint_slots":true}"#.as_slice(),
+        ] {
+            assert_eq!(parse_context(invalid, "demo"), None);
         }
     }
 }

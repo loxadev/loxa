@@ -6,15 +6,16 @@ use std::fmt;
 mod turns;
 
 pub use turns::{
-    AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, TurnCursor,
-    TurnPage, TurnSummary, MAX_CONTENT_RANGE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
+    AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
+    ContentRange, ContentSource, EngineDecodeRate, TurnCursor, TurnPage, TurnSummary,
+    MAX_CONTENT_RANGE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
 };
 
-pub const HISTORY_SCHEMA_VERSION: u32 = 3;
+pub const HISTORY_SCHEMA_VERSION: u32 = 5;
 pub const MAX_CONVERSATION_TITLE_BYTES: usize = 256;
 pub const MAX_CONVERSATION_PAGE_ITEMS: usize = 50;
 pub const MAX_CONVERSATION_PAGE_BYTES: usize = 24 * 1024;
-const MAX_ATTEMPT_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_ATTEMPT_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -36,6 +37,9 @@ pub enum HistoryCommand {
         conversation_id: String,
         cursor: Option<TurnCursor>,
         limit: u16,
+    },
+    GetAttempt {
+        attempt_id: String,
     },
     ReadContentRange {
         source: ContentSource,
@@ -85,6 +89,7 @@ impl HistoryCommand {
                 }
                 Ok(())
             }
+            Self::GetAttempt { attempt_id } => validate_hex_id(attempt_id),
             Self::ReadContentRange {
                 source,
                 start,
@@ -128,6 +133,7 @@ pub enum HistoryReply {
     Conversation(ConversationSummary),
     ConversationPage(ConversationPage),
     TurnPage(TurnPage),
+    Attempt(AttemptSummary),
     ContentRange(ContentRange),
     ConversationDeleted {
         conversation_id: String,
@@ -143,6 +149,7 @@ impl HistoryReply {
             Self::Conversation(conversation) => conversation.validate_shape(),
             Self::ConversationPage(page) => page.validate_shape(),
             Self::TurnPage(page) => page.validate_shape(),
+            Self::Attempt(attempt) => attempt.validate_shape(),
             Self::ContentRange(range) => range.validate_shape(),
             Self::ConversationDeleted {
                 conversation_id,

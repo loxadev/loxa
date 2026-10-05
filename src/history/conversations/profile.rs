@@ -64,8 +64,10 @@ fn read_stored(
 ) -> Result<Option<StoredProfile>, HistoryError> {
     connection
         .query_row(
-            "SELECT revision, profile_revision, updated_ms, system_instruction, max_output_tokens
-             FROM conversations WHERE id = ?1 AND deleted = 0",
+            "SELECT c.revision, c.profile_revision, c.updated_ms, c.system_instruction,
+                    c.max_output_tokens, s.conversation_id, s.temperature, s.top_p
+             FROM conversations c LEFT JOIN conversation_sampling s ON s.conversation_id = c.id
+             WHERE c.id = ?1 AND c.deleted = 0",
             [id.as_slice()],
             |row| {
                 use rusqlite::types::ValueRef;
@@ -102,6 +104,7 @@ fn read_stored(
                         ))
                     }
                 };
+                let (temperature, top_p) = super::super::sampling::read_conversation(row, 5, id)?;
                 Ok(StoredProfile {
                     revision,
                     profile_revision,
@@ -109,6 +112,8 @@ fn read_stored(
                     generation: GenerationSettings {
                         system_instruction: system_instruction.to_owned(),
                         max_output_tokens,
+                        temperature,
+                        top_p,
                     },
                 })
             },
@@ -183,6 +188,8 @@ fn patch_profile(
             "conversation profile revision changed",
         ));
     }
+    super::super::sampling::write_conversation(&transaction, id, &existing.generation)
+        .map_err(sql_error)?;
     transaction.commit().map_err(sql_error)?;
     Ok(ConversationProfile {
         conversation_id,

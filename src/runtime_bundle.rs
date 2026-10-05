@@ -6,6 +6,10 @@ mod recovery;
 mod stage;
 
 pub use inventory::validate_embedded_runtime;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) const fn bundled_commit() -> &'static str {
+    inventory::COMMIT
+}
 // Preserve the existing crate-visible facade paths.
 #[allow(unused_imports)]
 pub(crate) use record::STAGE_STATE_OFFSET;

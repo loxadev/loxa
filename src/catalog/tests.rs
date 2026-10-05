@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::removal::{remove_model_with_hook, RemovalPoint};
 use super::*;
 use tempfile::tempdir;
 
@@ -732,6 +734,73 @@ fn foreign_store_entries_do_not_hide_managed_models() {
     assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
 }
 
+#[test]
+fn catalog_and_bundle_pending_reads_share_the_four_mib_limit() {
+    let root = tempdir().unwrap();
+    let expected = bundle_manifest("gemma4");
+    let model_dir = root.path().join(&expected.id);
+    std::fs::create_dir(&model_dir).unwrap();
+    let manifest_path = model_dir.join("manifest.json");
+    let pending_path = model_dir.join("bundle.pending.json");
+    let mut bytes = serde_json::to_vec(&expected).unwrap();
+    bytes.resize(MAX_CATALOG_MANIFEST_BYTES, b' ');
+    for path in [&manifest_path, &pending_path] {
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected.clone()]);
+    assert!(
+        matches!(bundle_pending(&model_dir), BundlePending::Valid(found) if *found == expected)
+    );
+
+    bytes.push(b' ');
+    for path in [&manifest_path, &pending_path] {
+        std::fs::write(path, &bytes).unwrap();
+    }
+    assert!(load_catalog(root.path())
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert!(matches!(
+        bundle_pending(&model_dir),
+        BundlePending::UnsafeOrInvalid
+    ));
+
+    std::fs::File::create(&manifest_path)
+        .unwrap()
+        .set_len((MAX_CATALOG_MANIFEST_BYTES + 1) as u64)
+        .unwrap();
+    assert!(load_catalog(root.path())
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert_eq!(
+        std::fs::metadata(&manifest_path).unwrap().len(),
+        (MAX_CATALOG_MANIFEST_BYTES + 1) as u64,
+    );
+}
+
+#[test]
+fn history_manifest_reads_keep_the_smaller_admission_limit() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    let model_dir = root.path().join(&expected.id);
+    std::fs::create_dir(&model_dir).unwrap();
+    let path = model_dir.join("manifest.json");
+    let mut bytes = serde_json::to_vec(&expected).unwrap();
+    bytes.resize(256 * 1024, b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        load_model_manifest(root.path(), "demo").unwrap(),
+        Some(expected.clone())
+    );
+
+    bytes.push(b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(load_model_manifest(root.path(), "demo")
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn symlinked_model_directory_is_rejected_before_catalog_mutation() {
@@ -982,6 +1051,209 @@ fn removing_a_busy_model_is_rejected() {
     assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
     drop(lock);
 }
+
+#[cfg(unix)]
+#[test]
+fn removal_refuses_directory_replacement_after_audit_without_mutating_either_directory() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    write_artifact(root.path(), &expected.id);
+    publish_manifest(root.path(), &expected).unwrap();
+    let model_dir = root.path().join("demo");
+    drop(ModelLock::acquire(&model_dir).unwrap());
+    let retained = root.path().join("retained");
+    let installed = std::fs::read(model_dir.join("manifest.json")).unwrap();
+    let anchor = std::fs::read(model_dir.join(".lock")).unwrap();
+    let mut replaced = false;
+
+    let error = remove_model_with_hook(root.path(), &expected, |point| {
+        if point == RemovalPoint::AfterAudit {
+            std::fs::rename(&model_dir, &retained).unwrap();
+            std::fs::create_dir(&model_dir).unwrap();
+            std::fs::write(model_dir.join("manifest.json"), &installed).unwrap();
+            std::fs::write(model_dir.join("model.gguf"), b"replacement artifact").unwrap();
+            std::fs::write(model_dir.join(".lock"), b"replacement anchor").unwrap();
+            replaced = true;
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(replaced);
+    assert!(error.contains("directory changed"), "{error}");
+    assert_eq!(std::fs::read(retained.join("model.gguf")).unwrap(), b"abc");
+    assert_eq!(
+        std::fs::read(retained.join("manifest.json")).unwrap(),
+        installed
+    );
+    assert_eq!(std::fs::read(retained.join(".lock")).unwrap(), anchor);
+    assert_eq!(
+        std::fs::read(model_dir.join("manifest.json")).unwrap(),
+        installed
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"replacement artifact"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join(".lock")).unwrap(),
+        b"replacement anchor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_unlink_remains_anchored_if_directory_changes_after_its_final_check() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    write_artifact(root.path(), &expected.id);
+    publish_manifest(root.path(), &expected).unwrap();
+    let model_dir = root.path().join("demo");
+    let retained = root.path().join("retained");
+    let installed = std::fs::read(model_dir.join("manifest.json")).unwrap();
+    let mut replaced = false;
+
+    let error = remove_model_with_hook(root.path(), &expected, |point| {
+        if point == RemovalPoint::BeforeUnlink("model.gguf") {
+            std::fs::rename(&model_dir, &retained).unwrap();
+            std::fs::create_dir(&model_dir).unwrap();
+            std::fs::write(model_dir.join("manifest.json"), &installed).unwrap();
+            std::fs::write(model_dir.join("model.gguf"), b"replacement artifact").unwrap();
+            std::fs::write(model_dir.join(".lock"), b"replacement anchor").unwrap();
+            replaced = true;
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(replaced);
+    assert!(error.contains("directory changed"), "{error}");
+    assert!(!retained.join("model.gguf").exists());
+    assert_eq!(
+        std::fs::read(retained.join("manifest.json")).unwrap(),
+        installed
+    );
+    assert!(retained.join(".lock").is_file());
+    assert_eq!(
+        std::fs::read(model_dir.join("manifest.json")).unwrap(),
+        installed
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"replacement artifact"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join(".lock")).unwrap(),
+        b"replacement anchor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_keeps_manifest_until_artifacts_and_opaque_recovery_files_are_removed() {
+    let root = tempdir().unwrap();
+    let expected = local_manifest("demo");
+    write_artifact(root.path(), &expected.id);
+    publish_manifest(root.path(), &expected).unwrap();
+    let model_dir = root.path().join("demo");
+    let opaque_entries = [
+        "pending.json.tmp",
+        "verification-receipt.json",
+        "model.gguf.part",
+    ];
+    for name in opaque_entries {
+        std::fs::write(model_dir.join(name), b"opaque recovery bytes").unwrap();
+    }
+    let mut reached_manifest = false;
+
+    let error = remove_model_with_hook(root.path(), &expected, |point| {
+        if point == RemovalPoint::BeforeUnlink("manifest.json") {
+            reached_manifest = true;
+            for name in opaque_entries.into_iter().chain(["model.gguf"]) {
+                assert!(!model_dir.join(name).exists(), "{name} remains");
+            }
+            assert!(model_dir.join(".lock").is_file());
+            return Err("interrupted before manifest unlink".into());
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(reached_manifest);
+    assert_eq!(error, "interrupted before manifest unlink");
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_revalidates_all_audited_children_before_any_unlink() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    write_artifact(root.path(), &expected.id);
+    publish_manifest(root.path(), &expected).unwrap();
+    let model_dir = root.path().join("demo");
+    let recovery = model_dir.join("pending.json.tmp");
+    std::fs::write(&recovery, b"opaque").unwrap();
+
+    let error = remove_model_with_hook(root.path(), &expected, |point| {
+        if point == RemovalPoint::AfterAudit {
+            std::fs::rename(&recovery, root.path().join("old-recovery")).unwrap();
+            std::fs::write(&recovery, b"opaque").unwrap();
+        }
+        Ok(())
+    })
+    .unwrap_err();
+
+    assert!(error.contains("file changed"), "{error}");
+    assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), b"abc");
+    assert_eq!(std::fs::read(&recovery).unwrap(), b"opaque");
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_refuses_symlinked_recovery_entries_before_mutation() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    write_artifact(root.path(), &expected.id);
+    publish_manifest(root.path(), &expected).unwrap();
+    let foreign = root.path().join("foreign");
+    std::fs::write(&foreign, b"keep").unwrap();
+    std::os::unix::fs::symlink(&foreign, root.path().join("demo/model.gguf.part")).unwrap();
+
+    let error = remove_model(root.path(), &expected).unwrap_err();
+
+    assert!(error.contains("unsafe model entry"), "{error}");
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+    assert_eq!(
+        std::fs::read(root.path().join("demo/model.gguf")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+}
+
+#[cfg(unix)]
+#[test]
+fn removal_bounds_installed_and_pending_manifest_reads_before_mutation() {
+    for name in ["manifest.json", "pending.json"] {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let model_dir = root.path().join("demo");
+        std::fs::File::create(model_dir.join(name))
+            .unwrap()
+            .set_len(MAX_CATALOG_MANIFEST_BYTES as u64 + 1)
+            .unwrap();
+
+        let error = remove_model(root.path(), &expected).unwrap_err();
+
+        assert!(error.contains("byte limit"), "{name}: {error}");
+        assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), b"abc");
+        assert!(model_dir.join("manifest.json").is_file());
+    }
+}
+
 #[test]
 fn reconciliation_failure_does_not_block_a_valid_catalog() {
     let root = tempdir().unwrap();

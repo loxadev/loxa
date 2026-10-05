@@ -1,16 +1,64 @@
 use super::{
     history::{positive_bounded_decimal, validate_hex_id},
-    validate_decimal,
+    validate_decimal, OperationTarget, MAX_BUILD_BYTES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const MAX_SYSTEM_INSTRUCTION_BYTES: usize = 16 * 1024;
+const MIN_APPLIED_CONTEXT: u32 = 512;
+const MAX_APPLIED_CONTEXT: u32 = 32_768;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct SamplingValue(f64);
+
+impl SamplingValue {
+    pub fn new(value: f64) -> Option<Self> {
+        value.is_finite().then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for SamplingValue {
+    type Error = &'static str;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("sampling value must be finite")
+    }
+}
+
+impl From<SamplingValue> for f64 {
+    fn from(value: SamplingValue) -> Self {
+        value.get()
+    }
+}
+
+impl Eq for SamplingValue {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveSamplingSettings {
+    pub temperature: SamplingValue,
+    pub top_p: SamplingValue,
+}
+
+impl EffectiveSamplingSettings {
+    pub(crate) fn validate_shape(&self) -> Result<(), &'static str> {
+        validate_temperature(self.temperature)?;
+        validate_top_p(self.top_p)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationSettings {
     pub system_instruction: String,
     pub max_output_tokens: u32,
+    pub temperature: Option<SamplingValue>,
+    pub top_p: Option<SamplingValue>,
 }
 
 impl Default for GenerationSettings {
@@ -18,6 +66,8 @@ impl Default for GenerationSettings {
         Self {
             system_instruction: String::new(),
             max_output_tokens: 512,
+            temperature: None,
+            top_p: None,
         }
     }
 }
@@ -32,6 +82,28 @@ impl GenerationSettings {
         if self.max_output_tokens == 0 || self.max_output_tokens > i32::MAX as u32 {
             return Err("invalid maximum output token request");
         }
+        if let Some(value) = self.temperature {
+            validate_temperature(value)?;
+        }
+        if let Some(value) = self.top_p {
+            validate_top_p(value)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_temperature(value: SamplingValue) -> Result<(), &'static str> {
+    if value.get() < 0.0 {
+        Err("temperature must be nonnegative")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_top_p(value: SamplingValue) -> Result<(), &'static str> {
+    if !(0.0..=1.0).contains(&value.get()) {
+        Err("top P must be between zero and one")
+    } else {
         Ok(())
     }
 }
@@ -52,6 +124,13 @@ pub enum OptionalU16Patch {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OptionalSamplingValuePatch {
+    Set { value: SamplingValue },
+    Clear,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GenerationSettingsPatch {
     Fields {
         #[serde(
@@ -66,6 +145,18 @@ pub enum GenerationSettingsPatch {
             skip_serializing_if = "Option::is_none"
         )]
         max_output_tokens: Option<u32>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        temperature: Option<OptionalSamplingValuePatch>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        top_p: Option<OptionalSamplingValuePatch>,
     },
     Reset,
 }
@@ -76,8 +167,14 @@ impl GenerationSettingsPatch {
             Self::Fields {
                 system_instruction,
                 max_output_tokens,
+                temperature,
+                top_p,
             } => {
-                if system_instruction.is_none() && max_output_tokens.is_none() {
+                if system_instruction.is_none()
+                    && max_output_tokens.is_none()
+                    && temperature.is_none()
+                    && top_p.is_none()
+                {
                     return Err("generation settings patch is empty");
                 }
                 if system_instruction.as_ref().is_some_and(|value| {
@@ -88,6 +185,12 @@ impl GenerationSettingsPatch {
                 }
                 if max_output_tokens.is_some_and(|value| value == 0 || value > i32::MAX as u32) {
                     return Err("invalid maximum output token request");
+                }
+                if let Some(OptionalSamplingValuePatch::Set { value }) = temperature {
+                    validate_temperature(*value)?;
+                }
+                if let Some(OptionalSamplingValuePatch::Set { value }) = top_p {
+                    validate_top_p(*value)?;
                 }
                 Ok(())
             }
@@ -141,10 +244,56 @@ pub enum ServiceSettingsDurability {
     OutcomeUnknown,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceSettingsApplication {
     NotApplied,
+    Applied {
+        target: OperationTarget,
+        settings_revision: String,
+        context_preference: Option<u32>,
+        requested_context: u32,
+        observed_context: Option<u32>,
+        runtime_build: String,
+        runtime_version: String,
+        reload_required: bool,
+    },
+}
+
+impl ServiceSettingsApplication {
+    fn validate_shape(&self) -> Result<(), &'static str> {
+        let Self::Applied {
+            target,
+            settings_revision,
+            context_preference,
+            requested_context,
+            observed_context,
+            runtime_build,
+            runtime_version,
+            reload_required: _,
+        } = self
+        else {
+            return Ok(());
+        };
+        target.validate_shape()?;
+        validate_decimal(settings_revision, "invalid applied settings revision")?;
+        let valid_context =
+            |context| (MIN_APPLIED_CONTEXT..=MAX_APPLIED_CONTEXT).contains(&context);
+        if context_preference.is_some_and(|context| !valid_context(context))
+            || !valid_context(*requested_context)
+            || observed_context.is_some_and(|context| !valid_context(context))
+        {
+            return Err("invalid applied context");
+        }
+        if runtime_build.is_empty()
+            || runtime_build.len() > MAX_BUILD_BYTES
+            || runtime_version.is_empty()
+            || runtime_version.len() > MAX_BUILD_BYTES
+        {
+            return Err("invalid applied runtime identity");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -161,7 +310,8 @@ pub struct ServiceSettings {
 impl ServiceSettings {
     fn validate_shape(&self) -> Result<(), &'static str> {
         validate_decimal(&self.revision, "invalid service settings revision")?;
-        self.generation.validate_shape()
+        self.generation.validate_shape()?;
+        self.application.validate_shape()
     }
 }
 
@@ -289,6 +439,10 @@ mod tests {
             generation: Some(GenerationSettingsPatch::Fields {
                 system_instruction: Some("system".into()),
                 max_output_tokens: None,
+                temperature: Some(OptionalSamplingValuePatch::Set {
+                    value: SamplingValue::new(0.0).unwrap(),
+                }),
+                top_p: Some(OptionalSamplingValuePatch::Clear),
             }),
         };
         let encoded = serde_json::to_value(&patch).unwrap();
@@ -306,6 +460,24 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<ServiceSettingsPatch>(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn sampling_values_are_finite_and_profile_ranges_are_explicit() {
+        assert!(SamplingValue::new(f64::NAN).is_none());
+        assert!(SamplingValue::new(f64::INFINITY).is_none());
+
+        let mut settings = GenerationSettings {
+            temperature: Some(SamplingValue::new(0.0).unwrap()),
+            top_p: Some(SamplingValue::new(1.0).unwrap()),
+            ..GenerationSettings::default()
+        };
+        assert!(settings.validate_shape().is_ok());
+        settings.temperature = Some(SamplingValue::new(-0.1).unwrap());
+        assert!(settings.validate_shape().is_err());
+        settings.temperature = None;
+        settings.top_p = Some(SamplingValue::new(1.1).unwrap());
+        assert!(settings.validate_shape().is_err());
     }
 
     #[test]
@@ -338,6 +510,8 @@ mod tests {
                 patch: GenerationSettingsPatch::Fields {
                     system_instruction: None,
                     max_output_tokens: Some(1),
+                    temperature: None,
+                    top_p: None,
                 },
             }
         };

@@ -47,7 +47,7 @@ impl PreferenceAcknowledgement {
         }
     }
 
-    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
+    #[allow(dead_code, reason = "reserved for preferences UI integration")]
     pub(crate) fn result(&self) -> Option<Result<Preferences, PreferenceError>> {
         self.result
             .lock()
@@ -157,7 +157,7 @@ impl PreferencesOwner {
         })
     }
 
-    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
+    #[allow(dead_code, reason = "reserved for preferences UI integration")]
     pub(crate) fn snapshot(&self) -> Preferences {
         self.lock_state().committed.clone()
     }
@@ -207,7 +207,7 @@ impl PreferencesOwner {
         true
     }
 
-    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
+    #[allow(dead_code, reason = "reserved for preferences UI integration")]
     pub(crate) fn patch(
         &self,
         expected_revision: u64,

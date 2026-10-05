@@ -232,7 +232,16 @@ pub(super) fn prepare_directory(log_dir: &Path) -> Result<(), String> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(log_dir)
+            let mut directory = fs::DirBuilder::new();
+            directory.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+
+                directory.mode(0o700);
+            }
+            directory
+                .create(log_dir)
                 .map_err(|error| format!("{}: {error}", log_dir.display()))?;
         }
         Err(error) => return Err(format!("{}: {error}", log_dir.display())),

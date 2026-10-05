@@ -105,7 +105,7 @@ where
         .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
-    if manifest_bytes.len() > crate::catalog::transfer::MAX_CATALOG_MANIFEST_BYTES {
+    if manifest_bytes.len() > crate::catalog::MAX_CATALOG_MANIFEST_BYTES {
         return Err(TransferError::terminal(
             TransferErrorKind::CatalogManifestTooLarge,
         ));

@@ -15,7 +15,7 @@ use super::native::{parse_mach_o, validate_mach_o, MINIMUM_MACOS};
 
 const INVENTORY_SCHEMA: u32 = 1;
 const BUILD: &str = "b10344";
-const COMMIT: &str = "7a20b417f4526cae073bd997af5020cea3e7ccbe";
+pub(super) const COMMIT: &str = "7a20b417f4526cae073bd997af5020cea3e7ccbe";
 const VERSION_LINE: &str = "version: 10344 (7a20b417f)";
 const ARCHITECTURE: &str = "arm64";
 pub(super) const LICENSE_SHA256: &str =

@@ -1,33 +1,57 @@
 use super::*;
 use crate::catalog::{Manifest, Origin};
-use crate::history::{ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput};
+use crate::history::{
+    AttemptStatistics, ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput,
+};
 use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
+use crate::service::coordinator::generation::parser::SseDecoder;
+use crate::service::coordinator::generation::persistence::{OutputPipeline, SaveChunkFailure};
 use crate::service::coordinator::{Coordinator, HistoryExit, OwnerExit};
-use loxa_ipc::{ErrorCategory, HistoryCommand, HistoryPhase, HistoryReply};
+use loxa_ipc::{
+    AttemptStopReason, EffectiveSamplingSettings, ErrorCategory, GenerationTarget, HistoryCommand,
+    HistoryPhase, HistoryReply, SamplingValue,
+};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
+
+mod checkpoint;
+mod engine_failure;
+mod preflight;
 
 struct Fixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
     coordinator: Coordinator,
+    operation: Arc<crate::service::coordinator::OperationControl>,
     conversation_id: String,
     conversation_bytes: [u8; 16],
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_engine(super::super::state::EngineDescriptor {
+            pid: 42,
+            endpoint: Arc::new("/tmp/loxa-history-test-engine.sock".into()),
+        })
+        .await
+    }
+
+    async fn start_with_engine(engine: super::super::state::EngineDescriptor) -> Self {
         let directory = tempfile::Builder::new()
-            .prefix("loxa-coordinator-history-")
+            .prefix("lc-")
             .tempdir_in("/tmp")
             .unwrap();
         let directory_path = fs::canonicalize(directory.path()).unwrap();
         let root = directory_path.join("dev");
         let forbidden_root = directory_path.join("normal");
         fs::create_dir(&forbidden_root).unwrap();
-        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        // This owner runs in-process; bootstrap still validates the isolated origin.
+        let executable = directory_path.join("loxa-origin");
+        fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let bootstrap = loxa_ipc::initialize_development_root(
             &root,
             &forbidden_root,
@@ -70,11 +94,12 @@ impl Fixture {
             panic!("create conversation returned the wrong reply");
         };
         let conversation_bytes = decode_id(&conversation.id);
-        coordinator.force_ready_for_history_test(fingerprint);
+        let operation = coordinator.force_ready_for_history_test(fingerprint, engine);
         Self {
             _directory: directory,
             root,
             coordinator,
+            operation,
             conversation_id: conversation.id,
             conversation_bytes,
         }
@@ -86,8 +111,14 @@ impl Fixture {
             submission_id: [submission; 16],
             expected_conversation_revision: 1,
             expected_profile_revision: 1,
+            submission_hash: None,
+            effective_context: None,
             system_instruction: String::new(),
             max_output_tokens: 512,
+            effective_sampling: EffectiveSamplingSettings {
+                temperature: SamplingValue::new(0.8).unwrap(),
+                top_p: SamplingValue::new(0.95).unwrap(),
+            },
             prompt_basis: PromptBasis {
                 references: Vec::new(),
             },
@@ -98,25 +129,104 @@ impl Fixture {
         }
     }
 
-    async fn finish_stopped(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let owner = *self.coordinator.owner_exit_receiver().borrow();
-            let history = *self.coordinator.history_exit_receiver().borrow();
-            if matches!(owner, OwnerExit::Quiesced | OwnerExit::Failed)
-                && history == HistoryExit::Drained
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "owners did not drain"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        self.coordinator.release_runtime_if_durable();
-        self.coordinator.join_owner().unwrap();
+    fn reserve_pending(
+        &self,
+        input: &AdmissionInput,
+    ) -> (Arc<AdmissionReservation>, GenerationTarget) {
+        let pending = self.coordinator.register_generation_connection().unwrap();
+        let target = GenerationTarget::Pending {
+            boot_epoch: self.coordinator.boot_epoch().into(),
+            pending_nonce: pending.nonce().into(),
+        };
+        let claim = self.coordinator.shared.state().reserve_pending_admission(
+            &pending.pending,
+            input.conversation_id,
+            input.submission_id,
+            input.semantic_hash(),
+            input.expected_conversation_revision,
+            input.expected_profile_revision,
+            None,
+        );
+        let AdmissionClaim::Fresh(reservation) = claim.unwrap() else {
+            panic!("pending admission was not fresh");
+        };
+        (reservation, target)
     }
+
+    async fn assert_recovered_before_execution(
+        &self,
+        reservation: &Arc<AdmissionReservation>,
+        committed: &CommittedAdmission,
+    ) {
+        assert_eq!(committed.submission_id, reservation.submission_id);
+        assert_eq!(committed.conversation_id, reservation.conversation_id);
+        assert_eq!(
+            committed.operation_generation,
+            reservation.operation_generation
+        );
+        assert_eq!(committed.owner_epoch, self.coordinator.boot_epoch());
+        assert!(!self.coordinator.admission_active_for_test());
+        assert!(reservation.output.lock().unwrap().is_none());
+        assert!(matches!(
+            self.coordinator.status().phase,
+            loxa_ipc::RuntimePhase::Ready { .. }
+        ));
+        assert!(self.coordinator.history_is_ready());
+        assert_terminalized(&self.root, None);
+
+        let connection = rusqlite::Connection::open(self.root.join("app.sqlite")).unwrap();
+        let (attempts, matching): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(CASE WHEN id = ?1 AND submission_id = ?2
+                     AND owner_epoch = ?3 AND operation_generation = ?4 THEN 1 END)
+                 FROM attempts",
+                rusqlite::params![
+                    committed.attempt_id.as_slice(),
+                    reservation.submission_id.as_slice(),
+                    self.coordinator.boot_epoch(),
+                    reservation.operation_generation,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, matching), (1, 1));
+        connection.close().unwrap();
+
+        let (renamed, permit) = self
+            .coordinator
+            .history(HistoryCommand::RenameConversation {
+                conversation_id: self.conversation_id.clone(),
+                expected_revision: committed.post_conversation_revision.to_string(),
+                title: "Recovered".into(),
+            })
+            .await;
+        drop(permit);
+        assert!(matches!(renamed.unwrap(), HistoryReply::Conversation(_)));
+    }
+
+    async fn finish_stopped(&self) {
+        finish_stopped_coordinator(&self.coordinator).await;
+    }
+}
+
+async fn finish_stopped_coordinator(coordinator: &Coordinator) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let owner = *coordinator.owner_exit_receiver().borrow();
+        let history = *coordinator.history_exit_receiver().borrow();
+        if matches!(owner, OwnerExit::Quiesced | OwnerExit::Failed)
+            && history == HistoryExit::Drained
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owners did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    coordinator.release_runtime_if_durable();
+    coordinator.join_owner().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -259,7 +369,7 @@ async fn stop_inside_admission_transaction_terminalizes_before_drain() {
     commit.wait();
     wait_for_admission(observer).await.unwrap();
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -301,21 +411,33 @@ async fn committed_lookup_joins_an_active_matching_reservation() {
         wait_for_admission(duplicate).await.unwrap()
     );
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
     let fixture = Fixture::start().await;
     fixture.coordinator.drop_next_admission_reply_for_test();
-    fixture
-        .coordinator
-        .fail_next_stop_before_execution_for_test();
-    let input = fixture.input(5, "recover me");
+    fixture.coordinator.drop_next_persistence_reply_for_test();
+    let user_text = "recover me";
+    let submission_id = [5; 16];
+    let submission_hash = super::super::generation::stable_submission_hash(
+        fixture.conversation_bytes,
+        1,
+        1,
+        user_text,
+        None,
+    );
+    let mut input = fixture.input(5, user_text);
+    input.submission_hash = Some(submission_hash);
     let observer = fixture
         .coordinator
-        .admit_history_generation(input.clone())
+        .admit_history_generation(input)
         .await
+        .unwrap();
+    let pending = fixture
+        .coordinator
+        .register_generation_connection()
         .unwrap();
     fixture.coordinator.stop_service().unwrap();
 
@@ -327,18 +449,311 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(fixture.coordinator.admission_stop_retry_ready_for_test());
-    fixture.coordinator.stop_service().unwrap();
-    let duplicate = fixture
+    let reply = fixture
+        .coordinator
+        .generation_request(
+            loxa_ipc::GenerationCommand::Send {
+                conversation_id: fixture.conversation_id.clone(),
+                submission_id: crate::history::encode_id(submission_id),
+                expected_conversation_revision: "1".into(),
+                expected_profile_revision: "1".into(),
+                user_text: user_text.into(),
+                draft: None,
+            },
+            pending,
+        )
+        .await
+        .unwrap();
+    let committed = wait_for_admission(observer).await.unwrap();
+    let loxa_ipc::GenerationReply::Accepted(accepted) = reply else {
+        panic!("reconciled generation did not return Accepted");
+    };
+    assert_eq!(accepted.boot_epoch, committed.owner_epoch);
+    assert_eq!(
+        accepted.attempt_id,
+        crate::history::encode_id(committed.attempt_id)
+    );
+    assert_eq!(
+        accepted.operation_generation,
+        committed.operation_generation.to_string()
+    );
+    fixture.finish_stopped().await;
+    assert_terminalized(&fixture.root, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_submission_reconciles_durably_before_the_fresh_runtime_fence() {
+    let fixture = Fixture::start().await;
+    let target = loxa_ipc::OperationTarget {
+        boot_epoch: fixture.coordinator.boot_epoch().into(),
+        task_id: fixture.operation.task_id.to_string(),
+        generation: fixture.operation.generation.to_string(),
+    };
+    let user_text = "bound replay";
+    let submission_id = [28; 16];
+    let base_hash = super::super::generation::stable_submission_hash(
+        fixture.conversation_bytes,
+        1,
+        1,
+        user_text,
+        None,
+    );
+    let mut input = fixture.input(28, user_text);
+    input.submission_hash = Some(super::super::generation::runtime_bound_hash(
+        base_hash, &target,
+    ));
+    let observer = fixture
         .coordinator
         .admit_history_generation(input)
         .await
         .unwrap();
-    assert_eq!(
-        wait_for_admission(observer).await.unwrap(),
-        wait_for_admission(duplicate).await.unwrap()
-    );
+    let committed = wait_for_admission(observer).await.unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    wait_for_output(
+        output
+            .finalize(Arc::new(final_input(
+                &committed,
+                0,
+                "",
+                ExecutionOutcome::Stopped,
+            )))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!fixture.coordinator.admission_active_for_test());
+    fixture.coordinator.stop_service().unwrap();
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+
+    let bootstrap = loxa_ipc::ClientBootstrap::load(&fixture.root, None).unwrap();
+    let paths = crate::paths::AppPaths::from_values(Some(&fixture.root), None).unwrap();
+    let ownership = crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&paths.run)
+        .unwrap_or_else(|_| panic!("reacquire runtime ownership for bound replay"));
+    let reopened = Coordinator::start(
+        paths,
+        bootstrap.root().control_dir().to_owned(),
+        bootstrap.root().root_identity().to_owned(),
+        "test-machine-boot".into(),
+        "replacement-service-boot".into(),
+        ownership,
+        tokio::runtime::Handle::current(),
+        None,
+        None,
+    )
+    .unwrap();
+    wait_for_history_ready(&reopened).await;
+    assert!(!reopened.admission_active_for_test());
+    let command = loxa_ipc::GenerationCommand::Send {
+        conversation_id: fixture.conversation_id.clone(),
+        submission_id: crate::history::encode_id(submission_id),
+        expected_conversation_revision: "1".into(),
+        expected_profile_revision: "1".into(),
+        user_text: user_text.into(),
+        draft: None,
+    };
+    let changed = loxa_ipc::OperationTarget {
+        generation: "999".into(),
+        ..target.clone()
+    };
+    let conflicting_pending = reopened.register_generation_connection().unwrap();
+    let error = reopened
+        .generation_request_at(command.clone(), conflicting_pending, changed)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.category, ErrorCategory::Conflict);
+    let pending = reopened.register_generation_connection().unwrap();
+    let reply = reopened
+        .generation_request_at(command.clone(), pending, target.clone())
+        .await
+        .unwrap();
+    let loxa_ipc::GenerationReply::Accepted(accepted) = reply else {
+        panic!("bound replay did not return Accepted")
+    };
+    assert_eq!(
+        accepted.attempt_id,
+        crate::history::encode_id(committed.attempt_id)
+    );
+    assert_eq!(accepted.boot_epoch, target.boot_epoch);
+    assert_eq!(accepted.operation_generation, target.generation);
+    assert!(!reopened.admission_active_for_test());
+    reopened.stop_service().unwrap();
+    finish_stopped_coordinator(&reopened).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_stop_replays_exact_statistics_after_lost_terminal_acknowledgement() {
+    for accepted_target in [false, true] {
+        let fixture = Fixture::start().await;
+        fixture.coordinator.drop_next_persistence_reply_for_test();
+        let commit = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .set_admission_commit_barrier_for_test(Arc::clone(&commit));
+        let input = fixture.input(19, "recover targeted stop");
+        let (reservation, pending_target) = fixture.reserve_pending(&input);
+        let target = if accepted_target {
+            GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: crate::history::encode_id(reservation.submission_id),
+                operation_generation: reservation.operation_generation.to_string(),
+            }
+        } else {
+            pending_target
+        };
+        // Drive the admission boundary directly; no generation relay is started.
+        let observer = fixture
+            .coordinator
+            .dispatch_reserved_admission(
+                input,
+                reservation.submission_hash,
+                Arc::clone(&reservation),
+            )
+            .unwrap();
+        commit.wait();
+        let stopped = fixture.coordinator.stop_generation(&target);
+        commit.wait();
+        stopped.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !reservation.stop_retry_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first stop save did not reach its retry state");
+        assert!(observer.borrow().is_none());
+        assert!(reservation.is_cancelled());
+        assert!(fixture.coordinator.admission_active_for_test());
+        assert!(fixture
+            .coordinator
+            .shared
+            .state()
+            .begin_generation_execution(&reservation)
+            .is_err());
+        assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 0);
+        let first_statistics = attempt_statistics_row(&fixture.root);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let recovery = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_history_for_test(Arc::clone(&recovery));
+        recovery.wait();
+        let replies: Vec<_> = (0..8)
+            .map(|_| fixture.coordinator.stop_generation(&target))
+            .collect();
+        let claims = reservation.recovery_claims.load(Ordering::Relaxed);
+        let retry_ready = reservation.stop_retry_ready();
+        let unresolved = observer.borrow().is_none();
+        recovery.wait();
+        for reply in replies {
+            reply.unwrap();
+        }
+        assert_eq!(claims, 1);
+        assert!(!retry_ready);
+        assert!(unresolved);
+
+        let committed = tokio::time::timeout(Duration::from_secs(2), wait_for_admission(observer))
+            .await
+            .expect("targeted Stop did not resolve the original admission")
+            .unwrap();
+        assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 1);
+        fixture
+            .assert_recovered_before_execution(&reservation, &committed)
+            .await;
+        assert_eq!(attempt_statistics_row(&fixture.root), first_statistics);
+        fixture.coordinator.stop_service().unwrap();
+        fixture.finish_stopped().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_stop_reconciles_a_lost_admission_reply_without_replay() {
+    let fixture = Fixture::start().await;
+    fixture.coordinator.drop_next_admission_reply_for_test();
+    let input = fixture.input(20, "recover lost admission reply");
+    let (reservation, target) = fixture.reserve_pending(&input);
+    let observer = fixture
+        .coordinator
+        .dispatch_reserved_admission(input, reservation.submission_hash, Arc::clone(&reservation))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !reservation.admission_retry_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lost admission reply did not reach its retry state");
+    let expected = fixture
+        .coordinator
+        .shared
+        .history
+        .lookup_submission(reservation.submission_id, reservation.submission_hash)
+        .await
+        .unwrap()
+        .expect("admission committed before its reply was lost");
+
+    let unrelated = fixture
+        .coordinator
+        .register_generation_connection()
+        .unwrap();
+    let unrelated_target = GenerationTarget::Pending {
+        boot_epoch: fixture.coordinator.boot_epoch().into(),
+        pending_nonce: unrelated.nonce().into(),
+    };
+    fixture
+        .coordinator
+        .stop_generation(&unrelated_target)
+        .unwrap();
+    for invalid in [
+        GenerationTarget::Pending {
+            boot_epoch: "old-boot".into(),
+            pending_nonce: match &target {
+                GenerationTarget::Pending { pending_nonce, .. } => pending_nonce.clone(),
+                GenerationTarget::Accepted { .. } => unreachable!(),
+            },
+        },
+        GenerationTarget::Accepted {
+            boot_epoch: fixture.coordinator.boot_epoch().into(),
+            submission_id: crate::history::encode_id([21; 16]),
+            operation_generation: reservation.operation_generation.to_string(),
+        },
+    ] {
+        assert_eq!(
+            fixture
+                .coordinator
+                .stop_generation(&invalid)
+                .unwrap_err()
+                .category,
+            ErrorCategory::Conflict
+        );
+    }
+    drop(unrelated);
+    assert_eq!(
+        fixture
+            .coordinator
+            .stop_generation(&unrelated_target)
+            .unwrap_err()
+            .category,
+        ErrorCategory::NotFound
+    );
+    assert!(!reservation.is_cancelled());
+    assert!(reservation.admission_retry_ready());
+    assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 0);
+    assert!(observer.borrow().is_none());
+
+    fixture.coordinator.stop_generation(&target).unwrap();
+    let committed = tokio::time::timeout(Duration::from_secs(2), wait_for_admission(observer))
+        .await
+        .expect("targeted Stop did not reconcile the lost admission reply")
+        .unwrap();
+    assert_eq!(committed, expected);
+    assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 1);
+    fixture
+        .assert_recovered_before_execution(&reservation, &committed)
+        .await;
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -447,11 +862,11 @@ async fn committed_admission_hands_off_before_publish_and_stop_keeps_the_fence()
     assert_eq!(result.end, 0);
     assert!(!fixture.coordinator.admission_active_for_test());
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
+async fn output_owner_rejects_concurrent_intents_and_survives_dropped_observer() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
@@ -472,7 +887,13 @@ async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
     let checkpoint = Arc::new(suffix_input(&committed, 0, "saved"));
     let finalization = Arc::new(final_input(&committed, 5, "!", ExecutionOutcome::Completed));
     let checkpoint_observer = output.checkpoint(Arc::clone(&checkpoint)).unwrap();
-    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
+    assert_eq!(
+        output
+            .finalize(Arc::clone(&finalization))
+            .unwrap_err()
+            .category,
+        ErrorCategory::Busy
+    );
     drop(checkpoint_observer);
     assert_eq!(
         output
@@ -482,6 +903,14 @@ async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
         ErrorCategory::Busy
     );
     barrier.wait();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while output.status().unwrap() != (OutputSavePhase::Open { saved_end: 5 }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint did not resolve after its observer was dropped");
+    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
     assert_eq!(wait_for_output(final_observer).await.unwrap().end, 6);
     assert_eq!(
         output.status().unwrap(),
@@ -520,6 +949,22 @@ async fn failed_output_cancels_and_retry_reuses_the_exact_retained_suffix() {
         output.status().unwrap(),
         OutputSavePhase::SaveFailed { saved_end: 0 }
     );
+    let snapshot = fixture
+        .coordinator
+        .generation_status(&GenerationTarget::Accepted {
+            boot_epoch: committed.owner_epoch.clone(),
+            submission_id: crate::history::encode_id(committed.submission_id),
+            operation_generation: committed.operation_generation.to_string(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.execution,
+        loxa_ipc::GenerationExecutionPhase::Cancelling
+    );
+    assert_eq!(snapshot.save, loxa_ipc::GenerationSavePhase::SaveFailed);
+    assert_eq!(snapshot.failure_code.as_deref(), Some("output_save"));
+    assert_eq!(snapshot.generated_end, None);
     assert_eq!(Arc::strong_count(&suffix), 2);
 
     assert_eq!(
@@ -548,18 +993,184 @@ async fn failed_output_cancels_and_retry_reuses_the_exact_retained_suffix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains_history() {
+async fn failed_checkpoint_requires_exact_retry_before_a_terminal_intent() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
             .coordinator
-            .admit_history_generation(fixture.input(14, "retry pending final"))
+            .admit_history_generation(fixture.input(15, "retain stopped terminal"))
             .await
             .unwrap(),
     )
     .await
     .unwrap();
     let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let checkpoint = Arc::new(suffix_input(&committed, 0, "saved"));
+    fixture.coordinator.drop_next_persistence_reply_for_test();
+    assert!(
+        wait_for_output(output.checkpoint(Arc::clone(&checkpoint)).unwrap())
+            .await
+            .is_err()
+    );
+
+    let terminal = Arc::new(FinalizationInput {
+        failure_code: Some("output_save".into()),
+        ..final_input(&committed, 5, "tail", ExecutionOutcome::Failed)
+    });
+    assert_eq!(
+        output.finalize(Arc::clone(&terminal)).unwrap_err().category,
+        ErrorCategory::ServiceUnavailable
+    );
+    assert_eq!(Arc::strong_count(&checkpoint), 2);
+    assert_eq!(Arc::strong_count(&terminal), 1);
+    assert_eq!(
+        wait_for_output(output.retry_save().unwrap())
+            .await
+            .unwrap()
+            .end,
+        5
+    );
+    let final_observer = output.finalize(Arc::clone(&terminal)).unwrap();
+    assert_eq!(wait_for_output(final_observer).await.unwrap().end, 9);
+    assert_eq!(Arc::strong_count(&checkpoint), 1);
+    assert_eq!(Arc::strong_count(&terminal), 1);
+    assert!(!fixture.coordinator.admission_active_for_test());
+
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_output_envelope_cancels_then_drains_one_large_event_exactly() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(16, "large event"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let mut pipeline = OutputPipeline::new(output.clone(), committed.clone());
+    let content = "é".repeat(300_000);
+    let body = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n"
+    );
+    let mut decoder = SseDecoder::new();
+    let first = decoder.push(body.as_bytes()).unwrap().chunk.unwrap();
+
+    fixture.coordinator.drop_next_persistence_reply_for_test();
+    let barrier = Arc::new(Barrier::new(2));
+    fixture
+        .coordinator
+        .stall_history_for_test(Arc::clone(&barrier));
+    barrier.wait();
+    pipeline.save_chunk(first).unwrap();
+    let second = decoder.push(&[]).unwrap().chunk.unwrap();
+    assert!(matches!(
+        pipeline.save_chunk(second),
+        Err(SaveChunkFailure::Failed)
+    ));
+    assert!(output.is_cancelled());
+    assert_eq!(
+        output.status().unwrap(),
+        OutputSavePhase::SaveFailed { saved_end: 0 }
+    );
+    let snapshot = fixture
+        .coordinator
+        .generation_status(&GenerationTarget::Accepted {
+            boot_epoch: committed.owner_epoch.clone(),
+            submission_id: crate::history::encode_id(committed.submission_id),
+            operation_generation: committed.operation_generation.to_string(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.save, loxa_ipc::GenerationSavePhase::SaveFailed);
+    assert_eq!(snapshot.generated_end, None);
+    barrier.wait();
+
+    assert_eq!(
+        pipeline
+            .finish(
+                &mut decoder,
+                ExecutionOutcome::Failed,
+                Some("output_save"),
+                frozen_measurements(),
+            )
+            .await
+            .unwrap(),
+        ExecutionOutcome::Failed
+    );
+    assert!(!fixture.coordinator.admission_active_for_test());
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    let terminal: (i64, i64, i64, Option<i64>, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT execution_outcome, save_outcome, saved_end, generated_end,
+                    terminal_saved_end, failure_code FROM attempts",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    let length = i64::try_from(content.len()).unwrap();
+    assert_eq!(
+        terminal,
+        (
+            3,
+            1,
+            length,
+            Some(length),
+            Some(length),
+            Some("output_save".into()),
+        )
+    );
+    let saved = {
+        let mut statement = connection
+            .prepare("SELECT content FROM attempt_chunks ORDER BY start_offset")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .concat()
+    };
+    assert_eq!(saved, content);
+    connection.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_checkpoint_retries_before_terminal_and_stop_waits_for_durability() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(14, "retry before final"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let reservation = fixture
+        .coordinator
+        .shared
+        .state()
+        .current_admission()
+        .unwrap();
     let checkpoint = Arc::new(suffix_input(&committed, 0, "saved"));
     let finalization = Arc::new(final_input(&committed, 5, "!", ExecutionOutcome::Completed));
 
@@ -570,10 +1181,24 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
         .stall_history_for_test(Arc::clone(&barrier));
     barrier.wait();
     let checkpoint_observer = output.checkpoint(Arc::clone(&checkpoint)).unwrap();
-    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
+    assert_eq!(
+        output
+            .finalize(Arc::clone(&finalization))
+            .unwrap_err()
+            .category,
+        ErrorCategory::Busy
+    );
     fixture.coordinator.stop_service().unwrap();
+    assert_eq!(
+        reservation.cancellation_cause(),
+        Some(CancellationCause::Requested)
+    );
     barrier.wait();
     assert!(wait_for_output(checkpoint_observer).await.is_err());
+    assert_eq!(
+        reservation.cancellation_cause(),
+        Some(CancellationCause::Requested)
+    );
 
     assert!(fixture.coordinator.admission_active_for_test());
     assert_ne!(
@@ -581,7 +1206,7 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
         HistoryExit::Drained
     );
     assert_eq!(Arc::strong_count(&checkpoint), 2);
-    assert_eq!(Arc::strong_count(&finalization), 2);
+    assert_eq!(Arc::strong_count(&finalization), 1);
 
     assert_eq!(
         wait_for_output(output.retry_save().unwrap())
@@ -590,6 +1215,7 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
             .end,
         5
     );
+    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
     assert_eq!(wait_for_output(final_observer).await.unwrap().end, 6);
     assert_eq!(Arc::strong_count(&checkpoint), 1);
     assert_eq!(Arc::strong_count(&finalization), 1);
@@ -601,10 +1227,10 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
     fixture.finish_stopped().await;
 
     let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
-    let terminal: (i64, i64, i64, Option<i64>, Option<i64>) = connection
+    let terminal: (i64, i64, i64, Option<i64>, Option<i64>, Option<String>) = connection
         .query_row(
             "SELECT execution_outcome, save_outcome, saved_end, generated_end,
-                    terminal_saved_end FROM attempts",
+                    terminal_saved_end, failure_code FROM attempts",
             [],
             |row| {
                 Ok((
@@ -613,11 +1239,15 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .unwrap();
-    assert_eq!(terminal, (1, 1, 6, Some(6), Some(6)));
+    assert_eq!(
+        terminal,
+        (2, 1, 6, Some(6), Some(6), Some("stopped".into()))
+    );
     connection.close().unwrap();
 }
 
@@ -733,6 +1363,10 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
             .category,
         ErrorCategory::ServiceUnavailable
     );
+    let frozen = output
+        .publish_execution(ExecutionOutcome::Completed, None, 0, frozen_measurements())
+        .unwrap();
+    assert_eq!(frozen.outcome, ExecutionOutcome::Stopped);
     assert_eq!(
         output
             .finalize(Arc::new(final_input(
@@ -743,7 +1377,7 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
             )))
             .unwrap_err()
             .category,
-        ErrorCategory::ServiceUnavailable
+        ErrorCategory::Conflict
     );
     assert_eq!(
         wait_for_output(
@@ -762,7 +1396,168 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
         0
     );
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_terminal_inputs_leave_execution_unpublished() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(19, "validate terminal"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let mut wrong_attempt = final_input(&committed, 0, "wrong", ExecutionOutcome::Completed);
+    wrong_attempt.suffix.attempt_id = [0xff; 16];
+    let wrong_start = final_input(&committed, 1, "wrong", ExecutionOutcome::Completed);
+    for input in [wrong_attempt, wrong_start] {
+        assert_eq!(
+            output.finalize(Arc::new(input)).unwrap_err().category,
+            ErrorCategory::Conflict
+        );
+    }
+
+    let mut pipeline = OutputPipeline::new(output.clone(), committed.clone());
+    let mut decoder = SseDecoder::new();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        pipeline.finish(
+            &mut decoder,
+            ExecutionOutcome::Failed,
+            Some(""),
+            frozen_measurements(),
+        ),
+    )
+    .await
+    .expect("invalid publication entered the persistence retry loop")
+    .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Internal);
+    assert!(fixture.coordinator.admission_active_for_test());
+
+    let finalization = Arc::new(FinalizationInput {
+        failure_code: Some("engine_transport".into()),
+        ..final_input(&committed, 0, "", ExecutionOutcome::Failed)
+    });
+    let (observer, selected) = output.finalize_generation_owned(finalization).unwrap();
+    assert_eq!(selected, ExecutionOutcome::Failed);
+    assert_eq!(wait_for_output(observer).await.unwrap().end, 0);
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    let terminal: (i64, i64, String) = connection
+        .query_row(
+            "SELECT execution_outcome, generated_end, failure_code FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(terminal, (3, 0, "engine_transport".into()));
+    connection.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_terminal_atomically_normalizes_completion_when_stop_wins() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(17, "stop at terminal"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    fixture.coordinator.stop_service().unwrap();
+
+    let input = Arc::new(final_input(
+        &committed,
+        0,
+        "saved",
+        ExecutionOutcome::Completed,
+    ));
+    let (observer, selected) = output
+        .finalize_generation_owned(Arc::clone(&input))
+        .unwrap();
+    assert_eq!(selected, ExecutionOutcome::Stopped);
+    assert_eq!(wait_for_output(observer).await.unwrap().end, 5);
+    assert_eq!(Arc::strong_count(&input), 1);
+    fixture.finish_stopped().await;
+
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    let terminal: (i64, i64, i64, Option<String>) = connection
+        .query_row(
+            "SELECT execution_outcome, saved_end, generated_end, failure_code FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(terminal, (2, 5, 5, Some("stopped".into())));
+    connection.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_before_checkpoint_handoff_stays_stopped_and_saves_the_observed_tail() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(18, "stop before checkpoint"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let mut pipeline = OutputPipeline::new(output, committed);
+    let mut decoder = SseDecoder::new();
+    decoder
+        .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"saved\"}}]}\n\n")
+        .unwrap();
+    let tail = decoder.take_remaining_chunk().unwrap();
+    fixture.coordinator.stop_service().unwrap();
+    assert!(matches!(
+        pipeline.save_chunk(tail),
+        Err(SaveChunkFailure::Cancelled)
+    ));
+    assert_eq!(
+        pipeline
+            .finish(
+                &mut decoder,
+                ExecutionOutcome::Stopped,
+                Some("stopped"),
+                frozen_measurements(),
+            )
+            .await
+            .unwrap(),
+        ExecutionOutcome::Stopped
+    );
+    fixture.finish_stopped().await;
+
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    let terminal: (i64, i64, i64, Option<String>, String) = connection
+        .query_row(
+            "SELECT a.execution_outcome, a.saved_end, a.generated_end, a.failure_code, c.content
+             FROM attempts a JOIN attempt_chunks c ON c.attempt_id = a.id",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(terminal, (2, 5, 5, Some("stopped".into()), "saved".into()));
+    connection.close().unwrap();
 }
 
 async fn wait_for_admission(mut observer: AdmissionObserver) -> AdmissionResult {
@@ -812,7 +1607,25 @@ fn final_input(
         execution_outcome,
         generated_end: start + content.len() as u64,
         failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(1),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: 0,
+            stop_reason: match execution_outcome {
+                ExecutionOutcome::Completed => AttemptStopReason::Completed,
+                ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                ExecutionOutcome::Failed => AttemptStopReason::Failure,
+            },
+        }),
     }
+}
+
+fn frozen_measurements() -> AttemptMeasurements {
+    let mut measurements = AttemptMeasurements::new(1);
+    measurements.freeze_duration(Duration::ZERO);
+    measurements
 }
 
 async fn wait_for_history_ready(coordinator: &Coordinator) {
@@ -825,7 +1638,7 @@ async fn wait_for_history_ready(coordinator: &Coordinator) {
     assert_eq!(coordinator.history_status().phase, HistoryPhase::Ready);
 }
 
-fn assert_terminalized(root: &std::path::Path) {
+fn assert_terminalized(root: &std::path::Path, expected_qualified_input_tokens: Option<i64>) {
     let connection = rusqlite::Connection::open(root.join("app.sqlite")).unwrap();
     let terminal: (i64, i64, i64, Option<i64>, Option<i64>) = connection
         .query_row(
@@ -844,7 +1657,40 @@ fn assert_terminalized(root: &std::path::Path) {
         )
         .unwrap();
     assert_eq!(terminal, (2, 1, 0, Some(0), Some(0)));
+    let statistics = attempt_statistics_row(root);
+    assert_eq!(statistics.0, expected_qualified_input_tokens);
+    assert_eq!(statistics.1, None);
+    assert_eq!(statistics.2, None);
+    assert_eq!(statistics.3, None);
+    assert_eq!(statistics.5, 3);
     connection.close().unwrap();
+}
+
+fn attempt_statistics_row(
+    root: &std::path::Path,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>, i64, i64) {
+    let connection = rusqlite::Connection::open(root.join("app.sqlite")).unwrap();
+    let statistics = connection
+        .query_row(
+            "SELECT qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    connection.close().unwrap();
+    statistics
 }
 
 fn model_manifest() -> Manifest {

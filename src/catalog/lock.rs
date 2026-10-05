@@ -51,6 +51,7 @@ pub struct ModelLock {
     model_directory_identity: crate::safe_file::DirectoryIdentity,
     model_directory_path: PathBuf,
     acquiring_process_id: u32,
+    close_only_on_drop: bool,
 }
 
 impl ModelLock {
@@ -68,6 +69,26 @@ impl ModelLock {
 
     pub(crate) fn model_directory(&self) -> &std::fs::File {
         &self.model_directory
+    }
+
+    pub(crate) fn duplicate_for_service_child(&mut self) -> Result<fs::File, String> {
+        self.revalidate()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            let duplicate = self
+                .lock_file
+                .as_fd()
+                .try_clone_to_owned()
+                .map(fs::File::from)
+                .map_err(|error| error.to_string())?;
+            self.close_only_on_drop = true;
+            Ok(duplicate)
+        }
+        #[cfg(not(unix))]
+        {
+            Err("service model-lock inheritance requires Unix".into())
+        }
     }
 
     fn acquire_with_after_open(
@@ -106,6 +127,7 @@ impl ModelLock {
             model_directory_identity,
             model_directory_path: model_dir.to_owned(),
             acquiring_process_id: std::process::id(),
+            close_only_on_drop: false,
         };
         lock.revalidate().map_err(ModelLockFailure::unsafe_legacy)?;
         Ok(lock)
@@ -149,8 +171,9 @@ impl Drop for ModelLock {
     fn drop(&mut self) {
         // A concurrent fork can retain the locked file description until exec.
         // Only the acquiring process may unlock; an inherited guard must not
-        // release the parent's lock when dropped in a child.
-        if self.acquiring_process_id == std::process::id() {
+        // release the parent's lock when dropped in a child. A selected service
+        // child retains this description, so its parent's guard must only close.
+        if self.acquiring_process_id == std::process::id() && !self.close_only_on_drop {
             let _ = self.lock_file.unlock();
         }
     }

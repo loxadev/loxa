@@ -1,4 +1,7 @@
-use loxa_ipc::{ConversationProfile, DraftReply, GenerationSettings, HistoryReply, HistoryStatus};
+use loxa_ipc::{
+    AttemptSummary, ConversationProfile, DraftReply, GenerationSettings, HistoryReply,
+    HistoryStatus,
+};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -13,18 +16,29 @@ mod content;
 mod conversations;
 mod drafts;
 mod identity;
+mod prompt;
 mod purge;
 mod reads;
 mod recovery;
+mod sampling;
 mod schema;
+mod statistics;
 mod worker;
 
 pub(crate) use admission::{
-    AdmissionKind, CommittedAdmission, PreparedAdmission, PromptBasis, PromptReference,
+    AdmissionKind, CommittedAdmission, DraftSubmission, PreparedAdmission, PromptBasis,
+    PromptReference,
 };
 #[cfg(test)]
 pub(crate) use content::ContentRange;
-pub(crate) use content::{ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput};
+pub(crate) use content::{
+    ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput, MAX_SUFFIX_BYTES,
+};
+pub(crate) use identity::{decode_id, encode_id, parse_revision};
+#[cfg(test)]
+pub(crate) use prompt::PromptMessage;
+pub(crate) use prompt::{PromptPreparation, PromptRequest, PromptRole};
+pub(crate) use statistics::AttemptStatistics;
 
 const COMMAND_CAPACITY: usize = 12;
 const ORDINARY_CAPACITY: usize = 8;
@@ -51,6 +65,7 @@ pub(crate) enum HistoryErrorKind {
 pub(crate) struct HistoryError {
     kind: HistoryErrorKind,
     context: String,
+    native_sqlite_corruption: bool,
 }
 
 impl HistoryError {
@@ -58,6 +73,7 @@ impl HistoryError {
         Self {
             kind,
             context: context.into(),
+            native_sqlite_corruption: false,
         }
     }
 
@@ -67,6 +83,12 @@ impl HistoryError {
 
     pub(crate) fn context(&self) -> &str {
         &self.context
+    }
+
+    fn remap(mut self, kind: HistoryErrorKind, context: impl Into<String>) -> Self {
+        self.kind = kind;
+        self.context = context.into();
+        self
     }
 }
 
@@ -84,6 +106,19 @@ pub(crate) struct HistoryCompletion {
 }
 
 #[derive(Debug)]
+pub(crate) struct AttemptCompletion {
+    pub(crate) result: Result<AttemptSummary, HistoryError>,
+    pub(crate) permit: OwnedSemaphorePermit,
+}
+
+pub(crate) struct ObservedAttempt {
+    pub(crate) attempt_id: [u8; 16],
+    pub(crate) owner_epoch: String,
+    pub(crate) submission_id: [u8; 16],
+    pub(crate) operation_generation: i64,
+}
+
+#[derive(Debug)]
 pub(crate) struct DraftCompletion {
     pub(crate) result: Result<DraftReply, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
@@ -96,14 +131,14 @@ pub(crate) struct ProfileCompletion {
 }
 
 #[derive(Debug)]
-pub(crate) struct AdmissionCompletion {
-    pub(crate) result: Result<CommittedAdmission, HistoryError>,
+pub(crate) struct PromptCompletion {
+    pub(crate) result: Result<PromptPreparation, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
-pub(crate) struct RequiredCompletion {
-    pub(crate) result: Result<(), HistoryError>,
+pub(crate) struct AdmissionCompletion {
+    pub(crate) result: Result<CommittedAdmission, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
 }
 
@@ -126,9 +161,22 @@ enum HistoryCommand {
         reply: oneshot::Sender<ProfileCompletion>,
         permit: OwnedSemaphorePermit,
     },
+    ReadObservedAttempt {
+        observation: ObservedAttempt,
+        reply: oneshot::Sender<AttemptCompletion>,
+        permit: OwnedSemaphorePermit,
+    },
     ExecuteDraft {
         operation: loxa_ipc::DraftCommand,
         reply: oneshot::Sender<DraftCompletion>,
+        permit: OwnedSemaphorePermit,
+    },
+    PreparePrompt {
+        conversation_id: [u8; 16],
+        expected_conversation_revision: i64,
+        expected_profile_revision: i64,
+        request: PromptRequest,
+        reply: oneshot::Sender<PromptCompletion>,
         permit: OwnedSemaphorePermit,
     },
     LookupSubmission {
@@ -146,11 +194,6 @@ enum HistoryCommand {
     Admit {
         prepared: Arc<PreparedAdmission>,
         reply: oneshot::Sender<AdmissionCompletion>,
-        permit: OwnedSemaphorePermit,
-    },
-    StopBeforeExecution {
-        committed: CommittedAdmission,
-        reply: oneshot::Sender<RequiredCompletion>,
         permit: OwnedSemaphorePermit,
     },
     AppendSuffix {
@@ -178,10 +221,19 @@ enum HistoryCommand {
     #[cfg(test)]
     DropNextPersistenceReply(SyncSender<()>),
     #[cfg(test)]
-    FailNextStopBeforeExecution(SyncSender<()>),
-    #[cfg(test)]
     SetProgressInterval {
         instructions: i32,
+        ready: SyncSender<()>,
+    },
+    #[cfg(test)]
+    ObserveSqlError {
+        error: rusqlite::Error,
+        during_commit: bool,
+        reply: oneshot::Sender<HistoryError>,
+    },
+    #[cfg(test)]
+    SetNextPurgeError {
+        error: HistoryError,
         ready: SyncSender<()>,
     },
 }
@@ -377,6 +429,43 @@ impl HistoryHandle {
         })
     }
 
+    pub(crate) async fn read_observed_attempt(
+        &self,
+        observation: ObservedAttempt,
+    ) -> Result<AttemptCompletion, HistoryError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history is draining",
+            ));
+        }
+        let permit = Arc::clone(&self.ordinary)
+            .try_acquire_owned()
+            .map_err(|_| HistoryError::new(HistoryErrorKind::Busy, "history capacity is full"))?;
+        let (reply, completion) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::ReadObservedAttempt {
+                observation,
+                reply,
+                permit,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
+                }
+                TrySendError::Disconnected(_) => HistoryError::new(
+                    HistoryErrorKind::WorkerUnavailable,
+                    "history owner is unavailable",
+                ),
+            })?;
+        completion.await.map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history owner stopped before completing the attempt observation",
+            )
+        })
+    }
+
     pub(crate) async fn execute_draft(
         &self,
         operation: loxa_ipc::DraftCommand,
@@ -454,6 +543,49 @@ impl HistoryHandle {
         result
     }
 
+    pub(crate) async fn prepare_prompt(
+        &self,
+        conversation_id: [u8; 16],
+        expected_conversation_revision: i64,
+        expected_profile_revision: i64,
+        request: PromptRequest,
+    ) -> Result<PromptCompletion, HistoryError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history is draining",
+            ));
+        }
+        let permit = Arc::clone(&self.ordinary)
+            .try_acquire_owned()
+            .map_err(|_| HistoryError::new(HistoryErrorKind::Busy, "history capacity is full"))?;
+        let (reply, completion) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::PreparePrompt {
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                request,
+                reply,
+                permit,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
+                }
+                TrySendError::Disconnected(_) => HistoryError::new(
+                    HistoryErrorKind::WorkerUnavailable,
+                    "history owner is unavailable",
+                ),
+            })?;
+        completion.await.map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history owner stopped before prompt preparation completed",
+            )
+        })
+    }
+
     pub(crate) fn try_admit(
         &self,
         prepared: Arc<PreparedAdmission>,
@@ -510,34 +642,6 @@ impl HistoryHandle {
                 TrySendError::Disconnected(_) => HistoryError::new(
                     HistoryErrorKind::OutcomeUnknown,
                     "history owner cannot reconcile the admission",
-                ),
-            })?;
-        Ok(completion)
-    }
-
-    pub(crate) fn try_stop_before_execution(
-        &self,
-        committed: CommittedAdmission,
-    ) -> Result<oneshot::Receiver<RequiredCompletion>, HistoryError> {
-        let permit = Arc::clone(&self.persistence)
-            .try_acquire_owned()
-            .map_err(|_| {
-                HistoryError::new(HistoryErrorKind::Busy, "history terminal slot is full")
-            })?;
-        let (reply, completion) = oneshot::channel();
-        self.commands
-            .try_send(HistoryCommand::StopBeforeExecution {
-                committed,
-                reply,
-                permit,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
-                }
-                TrySendError::Disconnected(_) => HistoryError::new(
-                    HistoryErrorKind::OutcomeUnknown,
-                    "history owner cannot save cancelled admission",
                 ),
             })?;
         Ok(completion)
@@ -665,17 +769,6 @@ impl HistoryHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_stop_before_execution(&self) {
-        let (ready, received) = mpsc::sync_channel(0);
-        self.commands
-            .try_send(HistoryCommand::FailNextStopBeforeExecution(ready))
-            .expect("history terminal fault hook must fit the bounded queue");
-        received
-            .recv()
-            .expect("history owner must install the terminal fault hook");
-    }
-
-    #[cfg(test)]
     pub(crate) fn drop_next_persistence_reply(&self) {
         let (ready, received) = mpsc::sync_channel(0);
         self.commands
@@ -698,6 +791,33 @@ impl HistoryHandle {
         received
             .recv()
             .expect("history owner must install the progress hook");
+    }
+
+    #[cfg(test)]
+    async fn observe_sql_error(&self, error: rusqlite::Error, during_commit: bool) -> HistoryError {
+        let (reply, received) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::ObserveSqlError {
+                error,
+                during_commit,
+                reply,
+            })
+            .expect("history error observation must fit the bounded queue");
+        tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .expect("history error observation timed out")
+            .expect("history owner must observe the error")
+    }
+
+    #[cfg(test)]
+    fn set_next_purge_error(&self, error: HistoryError) {
+        let (ready, received) = mpsc::sync_channel(0);
+        self.commands
+            .try_send(HistoryCommand::SetNextPurgeError { error, ready })
+            .expect("history purge fault must fit the bounded queue");
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("history owner must install the purge fault");
     }
 
     #[cfg(test)]

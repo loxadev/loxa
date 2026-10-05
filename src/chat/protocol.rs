@@ -158,6 +158,7 @@ pub(super) struct SseDecoder {
 }
 
 impl SseDecoder {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self::with_limits(MAX_EVENT_BYTES, MAX_ASSISTANT_BYTES)
     }

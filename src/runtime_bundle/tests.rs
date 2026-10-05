@@ -199,6 +199,21 @@ fn interrupted_construction_is_never_published_and_next_acquire_recovers_it() {
 
 #[test]
 fn live_constructor_is_preserved_until_its_exact_owner_dies() {
+    if std::env::var_os("LOXA_TEST_LIVE_CONSTRUCTOR_ISOLATED").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_bundle::tests::live_constructor_is_preserved_until_its_exact_owner_dies",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("LOXA_TEST_LIVE_CONSTRUCTOR_ISOLATED", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+
     let root = tempfile::tempdir().unwrap();
     let run = root.path().join("run");
     fs::create_dir_all(&run).unwrap();

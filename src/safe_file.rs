@@ -234,7 +234,7 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<(File, RegularFileIde
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     let identity = regular_file_identity(&file, path)?;
@@ -316,8 +316,8 @@ fn changed_while_open(path: &Path, kind: &str) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{read_regular_file_bounded, read_regular_file_with_after_open};
+pub(crate) mod tests {
+    use super::{open_regular_file, read_regular_file_bounded, read_regular_file_with_after_open};
     use std::fs;
     use tempfile::tempdir;
 
@@ -382,20 +382,61 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn bounded_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+    pub(crate) fn assert_fifo_rejected_without_writer(
+        path: &std::path::Path,
+        read: impl FnOnce(&std::path::Path) -> bool + Send + 'static,
+    ) {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
 
-        let root = tempdir().unwrap();
-        let path = root.path().join("manifest.json");
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the test owns this path and keeps its NUL-terminated bytes alive.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let worker_path = path.to_owned();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rejected = read(&worker_path);
+            let _ = finished_tx.send(());
+            rejected
+        });
+        let finished_without_writer = finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        // Release a regressed blocking open before joining it. The extra reader
+        // makes opening the nonblocking writer safe even before the worker runs.
+        let _release = (!finished_without_writer).then(|| {
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .unwrap();
+            let writer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .unwrap();
+            (reader, writer)
+        });
+        let rejected = worker.join().unwrap();
 
-        let started = std::time::Instant::now();
-        let error = read_regular_file_bounded(&path, 1024).unwrap_err();
+        assert!(finished_without_writer, "FIFO open waited for a writer");
+        assert!(rejected, "FIFO was accepted as a regular file");
+    }
 
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_open_and_bounded_read_reject_a_fifo_without_waiting() {
+        for bounded in [false, true] {
+            let root = tempdir().unwrap();
+            assert_fifo_rejected_without_writer(&root.path().join("manifest.json"), move |path| {
+                let result = if bounded {
+                    read_regular_file_bounded(path, 1024).map(|_| ())
+                } else {
+                    open_regular_file(path).map(|_| ())
+                };
+                matches!(result, Err(error) if error.kind() == std::io::ErrorKind::InvalidData)
+            });
+        }
     }
 }

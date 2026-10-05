@@ -1,3 +1,4 @@
+use super::statistics::{self, AttemptStatistics};
 use super::{schema, HistoryError, HistoryErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -64,6 +65,7 @@ pub(crate) struct FinalizationInput {
     pub(crate) execution_outcome: ExecutionOutcome,
     pub(crate) generated_end: u64,
     pub(crate) failure_code: Option<String>,
+    pub(crate) statistics: Option<AttemptStatistics>,
 }
 
 impl FinalizationInput {
@@ -129,11 +131,8 @@ pub(super) fn append_suffix(
     if changed != 1 {
         return Err(conflict("attempt changed during suffix persistence"));
     }
-    transaction.commit().map_err(|_| {
-        HistoryError::new(
-            HistoryErrorKind::OutcomeUnknown,
-            "history suffix commit outcome is unknown",
-        )
+    transaction.commit().map_err(|error| {
+        schema::classify_commit_error(error, "history suffix commit outcome is unknown")
     })?;
     Ok(SuffixCommit {
         start: input.expected_saved_end,
@@ -186,6 +185,9 @@ pub(super) fn finalize(
             ],
         )
         .map_err(schema::classify_sql_error)?;
+    if let Some(statistics) = &input.statistics {
+        statistics::insert(&transaction, input.suffix.attempt_id, statistics)?;
+    }
     let changed = transaction
         .execute(
             "UPDATE attempts
@@ -206,11 +208,8 @@ pub(super) fn finalize(
     if changed != 1 {
         return Err(conflict("attempt changed during finalization"));
     }
-    transaction.commit().map_err(|_| {
-        HistoryError::new(
-            HistoryErrorKind::OutcomeUnknown,
-            "history finalization commit outcome is unknown",
-        )
+    transaction.commit().map_err(|error| {
+        schema::classify_commit_error(error, "history finalization commit outcome is unknown")
     })?;
     Ok(SuffixCommit {
         start: input.suffix.expected_saved_end,
@@ -341,6 +340,7 @@ fn reconcile_finalization(
     input: &FinalizationInput,
 ) -> Result<SuffixCommit, HistoryError> {
     let expected_end = suffix_end(&input.suffix)?;
+    let committed_statistics = statistics::read_for_attempt(connection, input.suffix.attempt_id)?;
     let final_range = connection
         .query_row(
             "SELECT start_offset, end_offset FROM attempt_finalizations WHERE attempt_id = ?1",
@@ -357,6 +357,7 @@ fn reconcile_finalization(
         || attempt.generated_end != Some(input.generated_end)
         || attempt.terminal_saved_end != Some(input.generated_end)
         || attempt.failure_code != input.failure_code
+        || committed_statistics != input.statistics
         || attempt.saved_end != input.generated_end
         || expected_end != input.generated_end
     {
@@ -415,6 +416,9 @@ fn validate_finalization(input: &FinalizationInput) -> Result<(), HistoryError> 
         code.is_empty() || code.len() > 64 || code.capacity() > 64 || !code.is_ascii()
     }) {
         return Err(invalid("invalid terminal failure code"));
+    }
+    if let Some(statistics) = &input.statistics {
+        statistics.validate_for(input.execution_outcome)?;
     }
     Ok(())
 }

@@ -204,6 +204,44 @@ pub(super) const CREATE_ATTEMPT_FINALIZATIONS_V3: &str = r#"CREATE TABLE attempt
     end_offset INTEGER NOT NULL CHECK (end_offset BETWEEN start_offset AND 16777216)
 ) STRICT, WITHOUT ROWID"#;
 
+pub(super) const CREATE_ATTEMPT_STATISTICS_V4: &str = r#"CREATE TABLE attempt_statistics (
+    attempt_id BLOB PRIMARY KEY NOT NULL REFERENCES attempts(id),
+    qualified_input_tokens INTEGER
+        CHECK (qualified_input_tokens BETWEEN 0 AND 4294967295),
+    qualified_output_tokens INTEGER
+        CHECK (qualified_output_tokens BETWEEN 0 AND 4294967295),
+    service_first_output_latency_ms INTEGER
+        CHECK (service_first_output_latency_ms >= 0),
+    qualified_engine_decode_tokens_per_second REAL
+        CHECK (qualified_engine_decode_tokens_per_second > 0.0
+               AND qualified_engine_decode_tokens_per_second < 1.0e308),
+    service_total_duration_ms INTEGER NOT NULL CHECK (service_total_duration_ms >= 0),
+    stop_reason INTEGER NOT NULL CHECK (stop_reason BETWEEN 1 AND 4),
+    CHECK (service_first_output_latency_ms IS NULL
+           OR service_first_output_latency_ms <= service_total_duration_ms),
+    CHECK (qualified_engine_decode_tokens_per_second IS NULL
+           OR qualified_output_tokens > 0)
+) STRICT, WITHOUT ROWID"#;
+
+pub(super) const CREATE_CONVERSATION_SAMPLING_V5: &str = r#"CREATE TABLE conversation_sampling (
+    conversation_id BLOB PRIMARY KEY NOT NULL REFERENCES conversations(id),
+    temperature REAL
+        CHECK (temperature IS NULL OR (typeof(temperature) = 'real'
+               AND temperature >= 0.0 AND temperature <= 1.7976931348623157e308)),
+    top_p REAL
+        CHECK (top_p IS NULL OR (typeof(top_p) = 'real' AND top_p BETWEEN 0.0 AND 1.0)),
+    CHECK (temperature IS NOT NULL OR top_p IS NOT NULL)
+) STRICT, WITHOUT ROWID"#;
+
+pub(super) const CREATE_ATTEMPT_SAMPLING_V5: &str = r#"CREATE TABLE attempt_sampling (
+    attempt_id BLOB PRIMARY KEY NOT NULL REFERENCES attempts(id),
+    temperature REAL NOT NULL
+        CHECK (typeof(temperature) = 'real'
+               AND temperature >= 0.0 AND temperature <= 1.7976931348623157e308),
+    top_p REAL NOT NULL
+        CHECK (typeof(top_p) = 'real' AND top_p BETWEEN 0.0 AND 1.0)
+) STRICT, WITHOUT ROWID"#;
+
 pub(super) const CREATE_TURNS_CONVERSATION_V3: &str = r#"CREATE INDEX turns_conversation
     ON turns (conversation_id, id)"#;
 pub(super) const CREATE_TURNS_SELECTED_ATTEMPT_V3: &str = r#"CREATE INDEX turns_selected_attempt

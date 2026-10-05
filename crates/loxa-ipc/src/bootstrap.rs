@@ -11,14 +11,104 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod user_root;
+mod user_service_root;
+pub use user_root::{PrivateUserRoot, RootPermissionRepair, UserRootError, UserRootInspection};
+
 pub const DEVELOPMENT_MARKER_FILENAME: &str = "loxa-development-root.json";
+pub const USER_SERVICE_MARKER_FILENAME: &str = "loxa-user-service-root.json";
 const ORIGIN_FILENAME: &str = "service-origin.json";
 const INSTANCE_LOCK_FILENAME: &str = "service-instance.lock";
 const MARKER_SCHEMA: u32 = 1;
 const ORIGIN_SCHEMA: u32 = 1;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+pub const ENGINE_SOCKET_NONCE_BYTES: usize = 16;
+pub const ENGINE_SOCKET_FILENAME_BYTES: usize = "engine-".len()
+    + u64::BITS as usize / 4
+    + "-".len()
+    + ENGINE_SOCKET_NONCE_BYTES * 2
+    + ".sock".len();
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootMode {
+    Development,
+    User,
+}
+
+impl RootMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::User => "user",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceRoot {
+    kind: ServiceRootKind,
+}
+
+#[derive(Clone, Debug)]
+enum ServiceRootKind {
+    Development(DevelopmentRoot),
+    User(std::sync::Arc<user_service_root::UserServiceRoot>),
+}
+
+impl ServiceRoot {
+    fn paths(&self) -> &DevelopmentRoot {
+        match &self.kind {
+            ServiceRootKind::Development(root) => root,
+            ServiceRootKind::User(root) => &root.paths,
+        }
+    }
+
+    pub fn mode(&self) -> RootMode {
+        match &self.kind {
+            ServiceRootKind::Development(_) => RootMode::Development,
+            ServiceRootKind::User(_) => RootMode::User,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        self.paths().root()
+    }
+
+    pub fn control_dir(&self) -> &Path {
+        self.paths().control_dir()
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        self.paths().socket_path()
+    }
+
+    pub fn root_identity(&self) -> &str {
+        self.paths().root_identity()
+    }
+
+    pub fn run_directory(&self) -> Option<&File> {
+        match &self.kind {
+            ServiceRootKind::Development(_) => None,
+            ServiceRootKind::User(root) => Some(&root.run),
+        }
+    }
+
+    pub fn validate_current(&self) -> Result<(), String> {
+        match &self.kind {
+            ServiceRootKind::Development(root) => root.validate_current(),
+            ServiceRootKind::User(root) => root.validate_current(),
+        }
+    }
+
+    pub fn acquire_instance(&self) -> Result<DevelopmentInstanceLock, String> {
+        match &self.kind {
+            ServiceRootKind::Development(root) => root.acquire_instance(),
+            ServiceRootKind::User(root) => root.acquire_instance(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DevelopmentRoot {
@@ -41,6 +131,11 @@ impl DevelopmentRoot {
             return Err("development data root must be its canonical path".into());
         }
         validate_private_directory(&canonical, "development data root")?;
+        match fs::symlink_metadata(canonical.join(USER_SERVICE_MARKER_FILENAME)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => return Err("data root is reserved for the user background service".into()),
+        }
         if let Some(forbidden) = forbidden_root {
             if paths_alias(&canonical, forbidden)? {
                 return Err("development data root must not be the normal Loxa data root".into());
@@ -194,7 +289,7 @@ impl OriginRecord {
 
 #[derive(Clone, Debug)]
 pub struct ClientBootstrap {
-    root: DevelopmentRoot,
+    root: ServiceRoot,
     origin: OriginRecord,
 }
 
@@ -203,7 +298,12 @@ impl ClientBootstrap {
         let root = DevelopmentRoot::load(root, forbidden_root)?;
         let origin: OriginRecord = read_record(&root.control_dir.join(ORIGIN_FILENAME))?;
         origin.validate_current()?;
-        Ok(Self { root, origin })
+        Ok(Self {
+            root: ServiceRoot {
+                kind: ServiceRootKind::Development(root),
+            },
+            origin,
+        })
     }
 
     pub fn load_expected(
@@ -212,18 +312,38 @@ impl ClientBootstrap {
         expected_root_identity: &str,
     ) -> Result<Self, String> {
         let bootstrap = Self::load(root, forbidden_root)?;
-        if bootstrap.root.root_identity != expected_root_identity {
+        if bootstrap.root.root_identity() != expected_root_identity {
             return Err("development data root identity changed".into());
         }
         Ok(bootstrap)
     }
 
-    pub fn root(&self) -> &DevelopmentRoot {
+    pub fn load_user(root: &Path) -> Result<Self, String> {
+        user_service_root::load(root)
+    }
+
+    pub fn load_user_expected(root: &Path, expected_root_identity: &str) -> Result<Self, String> {
+        let bootstrap = Self::load_user(root)?;
+        if bootstrap.root.root_identity() != expected_root_identity {
+            return Err("user data root identity changed".into());
+        }
+        Ok(bootstrap)
+    }
+
+    pub fn root(&self) -> &ServiceRoot {
         &self.root
     }
 
     pub fn origin(&self) -> &OriginRecord {
         &self.origin
+    }
+
+    pub fn validate_current_process(&self) -> Result<(), String> {
+        self.origin.validate_current()?;
+        self.validate_peer(PeerCredentials {
+            uid: current_uid(),
+            pid: std::process::id(),
+        })
     }
 
     pub fn validate_peer(&self, peer: PeerCredentials) -> Result<(), String> {
@@ -255,10 +375,12 @@ impl ClientBootstrap {
         self.root.validate_current()?;
         let mut child = Command::new(&self.origin.executable)
             .arg("__service-launch")
+            .arg("--root-mode")
+            .arg(self.root.mode().as_str())
             .arg("--data-root")
-            .arg(&self.root.root)
+            .arg(self.root.root())
             .arg("--root-identity")
-            .arg(&self.root.root_identity)
+            .arg(self.root.root_identity())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -284,6 +406,14 @@ impl ClientBootstrap {
             }
         }
     }
+}
+
+pub fn initialize_user_root(
+    root: PrivateUserRoot,
+    executable: &Path,
+    build: &str,
+) -> Result<ClientBootstrap, String> {
+    user_service_root::initialize(root, executable, build)
 }
 
 pub fn initialize_development_root(
@@ -428,7 +558,10 @@ fn require_initializer_only_tree(root: &Path, control_dir: &Path) -> Result<(), 
 }
 
 fn validate_socket_path_length(path: &Path) -> Result<(), String> {
-    let length = path.as_os_str().as_bytes().len();
+    validate_socket_path_byte_length(path.as_os_str().as_bytes().len())
+}
+
+fn validate_socket_path_byte_length(length: usize) -> Result<(), String> {
     if length > MAX_UNIX_SOCKET_PATH_BYTES {
         Err(format!(
             "service socket path is too long; choose a shorter development root ({length} bytes, maximum {MAX_UNIX_SOCKET_PATH_BYTES})"
@@ -441,7 +574,14 @@ fn validate_socket_path_length(path: &Path) -> Result<(), String> {
 fn validate_service_socket_paths(root: &Path) -> Result<(), String> {
     let control = root.join("run/service");
     validate_socket_path_length(&control.join("control.sock"))?;
-    validate_socket_path_length(&control.join("engine-ffffffffffffffff.sock"))
+    let engine_path_bytes = control
+        .as_os_str()
+        .as_bytes()
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(ENGINE_SOCKET_FILENAME_BYTES))
+        .ok_or_else(|| "service socket path length overflow".to_string())?;
+    validate_socket_path_byte_length(engine_path_bytes)
 }
 
 fn root_identity(path: &Path, uid: u32, device: u64, inode: u64) -> String {
@@ -464,6 +604,13 @@ fn acquire_instance_lock(path: &Path) -> Result<DevelopmentInstanceLock, String>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
+    let instance = lock_instance_file(file)?;
+    ensure_opened_path_unchanged(path, &metadata, &instance._file)?;
+    Ok(instance)
+}
+
+fn lock_instance_file(file: File) -> Result<DevelopmentInstanceLock, String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file()
         || metadata.nlink() != 1
         || metadata.uid() != current_uid()
@@ -478,7 +625,6 @@ fn acquire_instance_lock(path: &Path) -> Result<DevelopmentInstanceLock, String>
         }
         Err(std::fs::TryLockError::Error(error)) => return Err(error.to_string()),
     }
-    ensure_opened_path_unchanged(path, &metadata, &file)?;
     Ok(DevelopmentInstanceLock { _file: file })
 }
 
@@ -520,25 +666,37 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
 fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let mut file = open_regular(path)?;
     let opened = file.metadata().map_err(|error| error.to_string())?;
-    if opened.permissions().mode() & 0o077 != 0 {
-        return Err(format!("record is not private: {}", path.display()));
-    }
-    let mut bytes = Vec::with_capacity(1024);
-    Read::by_ref(&mut file)
-        .take((MAX_RECORD_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(format!("record is too large: {}", path.display()));
-    }
+    let record = read_record_contents(&mut file)?;
     let current = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if opened.dev() != current.dev() || opened.ino() != current.ino() {
         return Err(format!("record changed while reading: {}", path.display()));
     }
-    serde_json::from_slice(&bytes).map_err(|_| format!("record is invalid: {}", path.display()))
+    Ok(record)
+}
+
+fn read_record_contents<T: serde::de::DeserializeOwned>(file: &mut File) -> Result<T, String> {
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    validate_regular_file(&opened)?;
+    if opened.permissions().mode() & 0o077 != 0 {
+        return Err("service record is not private".into());
+    }
+    let mut bytes = Vec::with_capacity(1024);
+    Read::by_ref(file)
+        .take((MAX_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err("service record is too large".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "service record is invalid".into())
 }
 
 fn write_record_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let (bytes, written) = record_bytes(value)?;
+    write_record_bytes_atomic(path, &bytes[..written])
+}
+
+fn record_bytes<T: Serialize>(value: &T) -> Result<([u8; MAX_RECORD_BYTES], usize), String> {
     let mut bytes = [0_u8; MAX_RECORD_BYTES];
     let written = {
         let capacity = bytes.len();
@@ -550,6 +708,10 @@ fn write_record_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Strin
             .map_err(|_| "record is too large".to_string())?;
         capacity - remaining.len()
     };
+    Ok((bytes, written))
+}
+
+fn write_record_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "record path has no parent".to_string())?;
@@ -573,7 +735,7 @@ fn write_record_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Strin
         }
     };
     let (temporary_path, mut file) = temporary;
-    file.write_all(&bytes[..written])
+    file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| {
             let _ = fs::remove_file(&temporary_path);
@@ -597,10 +759,15 @@ fn open_regular(path: &Path) -> Result<File, String> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.file_type().is_file() || metadata.nlink() != 1 || metadata.uid() != current_uid() {
-        return Err(format!("unsafe record file: {}", path.display()));
-    }
+    validate_regular_file(&metadata)?;
     Ok(file)
+}
+
+fn validate_regular_file(metadata: &fs::Metadata) -> Result<(), String> {
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 || metadata.uid() != current_uid() {
+        return Err("unsafe service record file".into());
+    }
+    Ok(())
 }
 
 fn ensure_opened_path_unchanged(
@@ -659,12 +826,12 @@ mod tests {
     #[test]
     fn marked_root_is_private_canonical_and_cannot_alias_forbidden_root() {
         let root = tempfile::Builder::new()
-            .prefix("loxa-ipc-")
+            .prefix("li-")
             .tempdir_in("/tmp")
             .unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
         let forbidden = canonical_root.join("normal");
-        let development = canonical_root.join("development");
+        let development = canonical_root.join("dev");
         fs::create_dir(&forbidden).unwrap();
         fs::set_permissions(&forbidden, fs::Permissions::from_mode(0o700)).unwrap();
         initialize_development_root(

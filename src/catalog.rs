@@ -11,6 +11,8 @@ mod removal;
 mod transaction;
 pub(crate) mod transfer;
 
+pub(crate) const MAX_CATALOG_MANIFEST_BYTES: usize = 4_194_304;
+
 pub use inventory::load_catalog;
 pub(crate) use inventory::{load_model_manifest, load_reconciled_catalog};
 pub use lock::ModelLock;

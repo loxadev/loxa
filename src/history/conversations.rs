@@ -27,7 +27,15 @@ pub(super) fn execute(
     runtime_identity: RuntimeIdentity,
     operation: HistoryCommand,
 ) -> Result<HistoryReply, HistoryError> {
-    execute_with_generation(connection, models_root, runtime_identity, operation, None)
+    execute_with_generation(
+        connection,
+        models_root,
+        runtime_identity,
+        operation,
+        None,
+        super::purge::delete_batch,
+    )
+    .map(|(reply, _purge_error)| reply)
 }
 
 pub(super) fn execute_with_generation(
@@ -36,8 +44,10 @@ pub(super) fn execute_with_generation(
     runtime_identity: RuntimeIdentity,
     operation: HistoryCommand,
     generation: Option<GenerationSettings>,
-) -> Result<HistoryReply, HistoryError> {
-    match operation {
+    purge: impl FnOnce(&mut Connection) -> Result<bool, HistoryError>,
+) -> Result<(HistoryReply, Option<HistoryError>), HistoryError> {
+    let mut purge_error = None;
+    let result = match operation {
         HistoryCommand::GetHistoryStatus => Err(HistoryError::new(
             HistoryErrorKind::InvalidInput,
             "history status is not a database operation",
@@ -66,6 +76,9 @@ pub(super) fn execute_with_generation(
             limit,
         } => super::reads::list_turns(connection, &conversation_id, cursor, limit)
             .map(HistoryReply::TurnPage),
+        HistoryCommand::GetAttempt { attempt_id } => {
+            super::reads::get_attempt(connection, &attempt_id).map(HistoryReply::Attempt)
+        }
         HistoryCommand::ReadContentRange {
             source,
             start,
@@ -82,14 +95,21 @@ pub(super) fn execute_with_generation(
             // The tombstone is the logical deletion boundary. A later bounded
             // purge failure remains resumable and must not erase that fact from
             // the acknowledgement.
-            let purge_complete = super::purge::delete_batch(connection).unwrap_or(false);
+            let purge_complete = match purge(connection) {
+                Ok(complete) => complete,
+                Err(error) => {
+                    purge_error = Some(error);
+                    false
+                }
+            };
             Ok(HistoryReply::ConversationDeleted {
                 conversation_id,
                 revision: revision.to_string(),
                 purge_complete,
             })
         }
-    }
+    };
+    result.map(|reply| (reply, purge_error))
 }
 
 pub(super) fn execute_profile(
@@ -138,7 +158,8 @@ fn create(
         }
         None => (None, None, None, None, None, None, None),
     };
-    connection
+    let transaction = connection.transaction().map_err(sql_error)?;
+    transaction
         .execute(
             "INSERT INTO conversations (
                 id, model_id, manifest_version, binding_profile,
@@ -184,6 +205,8 @@ fn create(
             ],
         )
         .map_err(sql_error)?;
+    super::sampling::write_conversation(&transaction, id, &generation).map_err(sql_error)?;
+    transaction.commit().map_err(sql_error)?;
     Ok(summary(
         id,
         binding.model_id,

@@ -1,0 +1,1051 @@
+use crate::history::MAX_SUFFIX_BYTES;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
+use std::fmt;
+
+pub(super) const MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::service::coordinator) enum DecodeError {
+    OutputLimit,
+    EventLimit,
+    InvalidStream(&'static str),
+}
+
+pub(in crate::service::coordinator) struct DecodeStep {
+    pub(in crate::service::coordinator) consumed: usize,
+    pub(in crate::service::coordinator) chunk: Option<String>,
+    pub(in crate::service::coordinator) done: bool,
+}
+
+pub(in crate::service::coordinator) struct SseDecoder {
+    line: Vec<u8>,
+    data: Vec<u8>,
+    has_data: bool,
+    event_bytes: usize,
+    generated_end: usize,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    cached_prompt_tokens: Option<u32>,
+    engine_decode_tokens_per_second: Option<f64>,
+    finish_reason: Option<EngineFinishReason>,
+    done: bool,
+    poisoned: bool,
+    skip_lf: bool,
+    decoded: Option<DecodedContent>,
+    chunk: String,
+    chunk_ready: bool,
+}
+
+struct DecodedContent {
+    content: String,
+    offset: usize,
+}
+
+impl SseDecoder {
+    pub(in crate::service::coordinator) fn new() -> Self {
+        Self {
+            line: Vec::with_capacity(4096),
+            data: Vec::with_capacity(4096),
+            has_data: false,
+            event_bytes: 0,
+            generated_end: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_prompt_tokens: None,
+            engine_decode_tokens_per_second: None,
+            finish_reason: None,
+            done: false,
+            poisoned: false,
+            skip_lf: false,
+            decoded: None,
+            chunk: String::new(),
+            chunk_ready: false,
+        }
+    }
+
+    pub(in crate::service::coordinator) fn generated_end(&self) -> usize {
+        self.generated_end
+    }
+
+    pub(super) fn has_pending_chunk(&self) -> bool {
+        !self.chunk.is_empty()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn pending_chunk(&self) -> &str {
+        &self.chunk
+    }
+
+    pub(super) fn prompt_tokens(&self) -> Option<u32> {
+        self.prompt_tokens
+    }
+
+    pub(super) fn completion_tokens(&self) -> Option<u32> {
+        self.completion_tokens
+    }
+
+    pub(super) fn engine_decode_tokens_per_second(&self) -> Option<f64> {
+        self.engine_decode_tokens_per_second
+    }
+
+    pub(super) fn finish_reason(&self) -> Option<EngineFinishReason> {
+        self.finish_reason
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn cached_prompt_tokens(&self) -> Option<u32> {
+        self.cached_prompt_tokens
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_backing_bytes(&self) -> usize {
+        self.line
+            .capacity()
+            .saturating_add(self.data.capacity())
+            .saturating_add(self.chunk.capacity())
+            .saturating_add(
+                self.decoded
+                    .as_ref()
+                    .map_or(0, |decoded| decoded.content.capacity()),
+            )
+    }
+
+    pub(in crate::service::coordinator) fn push(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<DecodeStep, DecodeError> {
+        if self.poisoned {
+            return Err(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable",
+            ));
+        }
+        self.fill_chunk();
+        if let Some(chunk) = self.take_ready_chunk() {
+            return Ok(DecodeStep {
+                consumed: 0,
+                chunk: Some(chunk),
+                done: false,
+            });
+        }
+        if self.done {
+            return Ok(DecodeStep {
+                consumed: 0,
+                chunk: None,
+                done: true,
+            });
+        }
+
+        let mut consumed = 0;
+        for &byte in bytes {
+            self.event_bytes = self
+                .event_bytes
+                .checked_add(1)
+                .ok_or(DecodeError::EventLimit)?;
+            if self.event_bytes > MAX_EVENT_BYTES {
+                return self.poison(DecodeError::EventLimit);
+            }
+            consumed += 1;
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if byte == b'\r' || byte == b'\n' {
+                if byte == b'\r' {
+                    self.skip_lf = true;
+                }
+                if let Err(error) = self.end_line() {
+                    return self.poison(error);
+                }
+                self.fill_chunk();
+                if let Some(chunk) = self.take_ready_chunk() {
+                    return Ok(DecodeStep {
+                        consumed,
+                        chunk: Some(chunk),
+                        done: false,
+                    });
+                }
+                if self.done {
+                    break;
+                }
+            } else {
+                self.line.push(byte);
+            }
+        }
+        Ok(DecodeStep {
+            consumed,
+            chunk: None,
+            done: self.done,
+        })
+    }
+
+    pub(super) fn finish(&self) -> Result<(), DecodeError> {
+        if self.poisoned {
+            return Err(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable",
+            ));
+        }
+        if self.done && self.decoded.is_none() {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidStream(
+                "engine stream ended before its terminal event",
+            ))
+        }
+    }
+
+    pub(in crate::service::coordinator) fn take_remaining_chunk(&mut self) -> Option<String> {
+        self.fill_chunk();
+        if let Some(chunk) = self.take_ready_chunk() {
+            return Some(chunk);
+        }
+        if self.decoded.is_none() && !self.chunk.is_empty() {
+            return Some(std::mem::take(&mut self.chunk));
+        }
+        None
+    }
+
+    fn end_line(&mut self) -> Result<(), DecodeError> {
+        if self.line.is_empty() {
+            self.dispatch()?;
+            self.data.clear();
+            self.has_data = false;
+            self.event_bytes = 0;
+            return Ok(());
+        }
+        self.process_line()?;
+        self.line.clear();
+        Ok(())
+    }
+
+    fn process_line(&mut self) -> Result<(), DecodeError> {
+        if self.line.starts_with(b":") {
+            return Ok(());
+        }
+        let Some(mut start) = self.line.starts_with(b"data:").then_some(5) else {
+            return Ok(());
+        };
+        if self.line.get(start) == Some(&b' ') {
+            start += 1;
+        }
+        let value_len = self.line.len().saturating_sub(start);
+        let separator = usize::from(self.has_data);
+        let data_len = self
+            .data
+            .len()
+            .saturating_add(separator)
+            .saturating_add(value_len);
+        if data_len > MAX_EVENT_BYTES {
+            return Err(DecodeError::EventLimit);
+        }
+        if !self.has_data {
+            self.line.drain(..start);
+            std::mem::swap(&mut self.line, &mut self.data);
+        } else {
+            if data_len > self.data.capacity() {
+                // Both swapped buffers retain power-of-two capacities at most MAX_EVENT_BYTES.
+                self.data
+                    .reserve_exact(data_len.next_power_of_two() - self.data.len());
+            }
+            self.data.push(b'\n');
+            self.data.extend_from_slice(&self.line[start..]);
+        }
+        self.has_data = true;
+        Ok(())
+    }
+
+    fn dispatch(&mut self) -> Result<(), DecodeError> {
+        if !self.has_data {
+            return Ok(());
+        }
+        if self.data == b"[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let payload: StreamPayload<'_> = serde_json::from_slice(&self.data)
+            .map_err(|_| DecodeError::InvalidStream("engine returned malformed streaming JSON"))?;
+        if payload.error.is_some() {
+            return Err(DecodeError::InvalidStream(
+                "engine reported a generation failure",
+            ));
+        }
+        let choice = payload.choices.0;
+        if let Some(usage) = payload.usage {
+            if choice.is_some() {
+                return Err(DecodeError::InvalidStream(
+                    "engine returned usage with a streaming choice",
+                ));
+            }
+            let cached = usage
+                .prompt_tokens_details
+                .map(|details| details.cached_tokens);
+            if cached.is_some_and(|cached| cached > usage.prompt_tokens) {
+                return Err(DecodeError::InvalidStream(
+                    "engine returned an invalid cached-token count",
+                ));
+            }
+            let completion = match (usage.completion_tokens, usage.total_tokens) {
+                (Some(completion), Some(total)) => {
+                    if usage.prompt_tokens.checked_add(completion) != Some(total) {
+                        return Err(DecodeError::InvalidStream(
+                            "engine returned inconsistent total-token usage",
+                        ));
+                    }
+                    Some(completion)
+                }
+                (None, Some(total)) if total < usage.prompt_tokens => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine returned inconsistent total-token usage",
+                    ));
+                }
+                _ => None,
+            };
+            let rate = completion.and_then(|tokens| qualified_decode_rate(payload.timings, tokens));
+            match self.prompt_tokens {
+                None => {
+                    self.prompt_tokens = Some(usage.prompt_tokens);
+                    self.completion_tokens = completion;
+                    self.cached_prompt_tokens = cached;
+                    self.engine_decode_tokens_per_second = rate;
+                }
+                Some(existing_prompt) if existing_prompt == usage.prompt_tokens => {
+                    if matches!(
+                        (self.completion_tokens, completion),
+                        (Some(existing), Some(current)) if existing != current
+                    ) || matches!(
+                        (self.cached_prompt_tokens, cached),
+                        (Some(existing), Some(current)) if existing != current
+                    ) {
+                        return Err(DecodeError::InvalidStream(
+                            "engine changed its streaming usage",
+                        ));
+                    }
+                    let existing_completion = self.completion_tokens;
+                    let existing_rate = self.engine_decode_tokens_per_second;
+                    self.completion_tokens = self.completion_tokens.or(completion);
+                    self.cached_prompt_tokens = self.cached_prompt_tokens.or(cached);
+                    match (existing_completion, completion) {
+                        (None, Some(_)) => self.engine_decode_tokens_per_second = rate,
+                        (Some(_), Some(_)) if !rates_match(existing_rate, rate) => {
+                            self.engine_decode_tokens_per_second = None;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(_) => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine changed its streaming usage",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let Some(choice) = choice else {
+            return Ok(());
+        };
+        if choice.index != 0 {
+            return Err(DecodeError::InvalidStream(
+                "engine returned an unexpected streaming choice",
+            ));
+        }
+        if let Some(reason) = choice.finish_reason {
+            if choice
+                .delta
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty())
+            {
+                return Err(DecodeError::InvalidStream(
+                    "engine returned content with its finish reason",
+                ));
+            }
+            let reason = match reason {
+                WireFinishReason::Stop => EngineFinishReason::Completed,
+                WireFinishReason::Length => EngineFinishReason::OutputLimit,
+                WireFinishReason::ToolCalls => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine returned an unsupported tool-call finish reason",
+                    ))
+                }
+            };
+            match self.finish_reason {
+                None => self.finish_reason = Some(reason),
+                Some(existing) if existing == reason => {}
+                Some(_) => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine changed its streaming finish reason",
+                    ))
+                }
+            }
+            return Ok(());
+        }
+        let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) else {
+            return Ok(());
+        };
+        let next = self
+            .generated_end
+            .checked_add(content.len())
+            .ok_or(DecodeError::OutputLimit)?;
+        if next > MAX_OUTPUT_BYTES {
+            return Err(DecodeError::OutputLimit);
+        }
+        self.generated_end = next;
+        self.decoded = Some(DecodedContent { content, offset: 0 });
+        Ok(())
+    }
+
+    fn fill_chunk(&mut self) {
+        loop {
+            if self
+                .decoded
+                .as_ref()
+                .is_some_and(|decoded| decoded.offset == decoded.content.len())
+            {
+                self.decoded = None;
+                continue;
+            }
+            let Some(decoded) = self.decoded.as_ref() else {
+                return;
+            };
+            if self.chunk.capacity() == 0 {
+                self.chunk = String::with_capacity(MAX_SUFFIX_BYTES);
+            }
+            let available = MAX_SUFFIX_BYTES.saturating_sub(self.chunk.len());
+            let remaining = &decoded.content[decoded.offset..];
+            let split = utf8_prefix(remaining, available);
+            if split == 0 {
+                self.chunk_ready = true;
+                return;
+            }
+            self.chunk.push_str(&remaining[..split]);
+            self.decoded
+                .as_mut()
+                .expect("decoded content exists")
+                .offset += split;
+            if self.chunk.len() == MAX_SUFFIX_BYTES {
+                self.chunk_ready = true;
+                return;
+            }
+        }
+    }
+
+    fn take_ready_chunk(&mut self) -> Option<String> {
+        self.chunk_ready.then(|| {
+            self.chunk_ready = false;
+            std::mem::take(&mut self.chunk)
+        })
+    }
+
+    fn poison<T>(&mut self, error: DecodeError) -> Result<T, DecodeError> {
+        self.poisoned = true;
+        self.line.clear();
+        self.data.clear();
+        Err(error)
+    }
+}
+
+fn utf8_prefix(value: &str, maximum: usize) -> usize {
+    if value.len() <= maximum {
+        return value.len();
+    }
+    let mut split = maximum;
+    while split > 0 && !value.is_char_boundary(split) {
+        split -= 1;
+    }
+    split
+}
+
+#[derive(Deserialize)]
+struct StreamPayload<'a> {
+    #[serde(default)]
+    choices: AtMostOneChoice,
+    error: Option<EngineError>,
+    usage: Option<Usage>,
+    #[serde(borrow)]
+    timings: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokenDetails {
+    cached_tokens: u32,
+}
+
+#[derive(Default)]
+struct AtMostOneChoice(Option<Choice>);
+
+impl<'de> Deserialize<'de> for AtMostOneChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ChoiceVisitor;
+        impl<'de> Visitor<'de> for ChoiceVisitor {
+            type Value = AtMostOneChoice;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("zero or one streaming choice")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let first = sequence.next_element::<Choice>()?;
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "engine returned multiple streaming choices",
+                    ));
+                }
+                Ok(AtMostOneChoice(first))
+            }
+        }
+        deserializer.deserialize_seq(ChoiceVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    index: u32,
+    delta: Delta,
+    finish_reason: Option<WireFinishReason>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EngineFinishReason {
+    Completed,
+    OutputLimit,
+}
+
+fn qualified_decode_rate(timings: Option<&RawValue>, completion_tokens: u32) -> Option<f64> {
+    let timings = serde_json::from_str::<Timings>(timings?.get()).ok()?;
+    let tokens = timings.predicted_n;
+    let milliseconds = timings.predicted_ms;
+    let rate = timings.predicted_per_second;
+    if tokens != completion_tokens
+        || tokens == 0
+        || !milliseconds.is_finite()
+        || milliseconds <= 0.0
+        || !rate.is_finite()
+        || rate <= 0.0
+    {
+        return None;
+    }
+    let derived = 1000.0 * f64::from(tokens) / milliseconds;
+    if !derived.is_finite() {
+        return None;
+    }
+    let tolerance = derived.abs().max(rate.abs()).max(1.0) * 1e-9;
+    ((derived - rate).abs() <= tolerance).then_some(rate)
+}
+
+#[derive(Deserialize)]
+struct Timings {
+    predicted_n: u32,
+    predicted_ms: f64,
+    predicted_per_second: f64,
+}
+
+fn rates_match(left: Option<f64>, right: Option<f64>) -> bool {
+    left.map(f64::to_bits) == right.map(f64::to_bits)
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+}
+
+struct EngineError;
+
+impl<'de> Deserialize<'de> for EngineError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ErrorVisitor;
+        impl<'de> Visitor<'de> for ErrorVisitor {
+            type Value = EngineError;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an engine error object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(EngineError)
+            }
+        }
+        deserializer.deserialize_map(ErrorVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(chunks: &[&[u8]]) -> Result<(Vec<String>, usize, usize), DecodeError> {
+        let mut decoder = SseDecoder::new();
+        let mut output = Vec::new();
+        for bytes in chunks {
+            let mut offset = 0;
+            loop {
+                let step = decoder.push(&bytes[offset..])?;
+                offset += step.consumed;
+                let emitted = step.chunk.is_some();
+                if let Some(chunk) = step.chunk {
+                    output.push(chunk);
+                }
+                if step.done {
+                    break;
+                }
+                if offset == bytes.len() && !emitted {
+                    break;
+                }
+                if step.consumed == 0 && !emitted {
+                    return Err(DecodeError::InvalidStream("decoder made no progress"));
+                }
+            }
+        }
+        decoder.finish()?;
+        while let Some(chunk) = decoder.take_remaining_chunk() {
+            output.push(chunk);
+        }
+        Ok((
+            output,
+            decoder.generated_end(),
+            decoder.retained_backing_bytes(),
+        ))
+    }
+
+    #[test]
+    fn fragmented_utf8_and_crlf_are_emitted_without_a_full_answer_copy() {
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"héllo\"}}]}\r\n\r\ndata: [DONE]\n\n";
+        let split = body.find('é').unwrap() + 1;
+        let (output, generated_end, _) =
+            decode(&[&body.as_bytes()[..split], &body.as_bytes()[split..]]).unwrap();
+        assert_eq!(generated_end, 6);
+        assert_eq!(output.concat(), "héllo");
+    }
+
+    #[test]
+    fn repeated_events_reuse_both_scratch_allocations() {
+        let mut decoder = SseDecoder::new();
+        let mut original = [decoder.line.as_ptr(), decoder.data.as_ptr()];
+        original.sort_unstable();
+        for _ in 0..8 {
+            let step = decoder.push(b"data: {\"choices\":[]}\n\n").unwrap();
+            assert!(step.chunk.is_none());
+            let mut current = [decoder.line.as_ptr(), decoder.data.as_ptr()];
+            current.sort_unstable();
+            assert_eq!(current, original);
+            assert!(decoder.line.is_empty());
+            assert!(decoder.data.is_empty());
+        }
+    }
+
+    #[test]
+    fn multiline_then_large_and_small_events_keep_retained_backing_bounded() {
+        let multiline = format!(
+            "data: {{\"padding\":\"{}\",\ndata: \"tail\":\"{}\"}}\n\n",
+            "x".repeat(310_000),
+            "y".repeat(400_000),
+        );
+        let content = "é".repeat(400_000);
+        let large = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let mut recovered = String::new();
+        for event in [&multiline, &large, &large] {
+            let mut offset = 0;
+            loop {
+                let step = decoder.push(&event.as_bytes()[offset..]).unwrap();
+                offset += step.consumed;
+                assert!(decoder.line.capacity() <= MAX_EVENT_BYTES);
+                assert!(decoder.data.capacity() <= MAX_EVENT_BYTES);
+                let emitted_capacity = step.chunk.as_ref().map_or(0, String::capacity);
+                assert!(
+                    decoder.retained_backing_bytes() + emitted_capacity
+                        <= 3 * MAX_EVENT_BYTES + MAX_SUFFIX_BYTES
+                );
+                let emitted = step.chunk.is_some();
+                if let Some(chunk) = step.chunk {
+                    assert_eq!(chunk.capacity(), MAX_SUFFIX_BYTES);
+                    recovered.push_str(&chunk);
+                }
+                if offset == event.len() && !emitted {
+                    break;
+                }
+                assert!(step.consumed > 0 || emitted);
+            }
+        }
+        assert_eq!(decoder.line.capacity(), MAX_EVENT_BYTES);
+        assert_eq!(decoder.data.capacity(), MAX_EVENT_BYTES);
+        for _ in 0..16 {
+            let step = decoder.push(b"data: {\"choices\":[]}\n\n").unwrap();
+            assert!(step.chunk.is_none());
+            assert_eq!(decoder.line.capacity(), MAX_EVENT_BYTES);
+            assert_eq!(decoder.data.capacity(), MAX_EVENT_BYTES);
+            assert!(decoder.retained_backing_bytes() <= 2 * MAX_EVENT_BYTES + MAX_SUFFIX_BYTES);
+        }
+        assert!(decoder.push(b"data: [DONE]\n\n").unwrap().done);
+        decoder.finish().unwrap();
+        while let Some(chunk) = decoder.take_remaining_chunk() {
+            assert!(chunk.capacity() <= MAX_SUFFIX_BYTES);
+            recovered.push_str(&chunk);
+        }
+        assert_eq!(recovered, content.repeat(2));
+        assert_eq!(decoder.generated_end(), 2 * content.len());
+        assert_eq!(decoder.retained_backing_bytes(), 2 * MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn terminal_usage_records_total_prompt_tokens_without_becoming_output() {
+        let body = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+            "\"completion_tokens\":2,\"total_tokens\":39,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":11}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = SseDecoder::new();
+        let step = decoder.push(body.as_bytes()).unwrap();
+        assert!(step.done);
+        assert!(step.chunk.is_none());
+        decoder.finish().unwrap();
+        assert_eq!(decoder.prompt_tokens(), Some(37));
+        assert_eq!(decoder.cached_prompt_tokens, Some(11));
+        assert_eq!(decoder.completion_tokens(), Some(2));
+        assert_eq!(decoder.generated_end(), 0);
+
+        let mut prompt_only = SseDecoder::new();
+        prompt_only
+            .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37}}\n\ndata: [DONE]\n\n")
+            .unwrap();
+        prompt_only.finish().unwrap();
+        assert_eq!(prompt_only.prompt_tokens(), Some(37));
+        assert_eq!(prompt_only.completion_tokens(), None);
+        assert_eq!(prompt_only.engine_decode_tokens_per_second(), None);
+
+        let mut contradictory = SseDecoder::new();
+        assert_eq!(
+            contradictory
+                .push(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"total_tokens\":36}}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine returned inconsistent total-token usage"
+            ))
+        );
+
+        let mut invalid = SseDecoder::new();
+        assert_eq!(
+            invalid.push(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
+            ).err(),
+            Some(DecodeError::InvalidStream("engine returned usage with a streaming choice"))
+        );
+    }
+
+    #[test]
+    fn terminal_usage_qualifies_complete_consistent_engine_timings() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_ms\":20.0,",
+                    "\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(decoder.completion_tokens(), Some(2));
+        assert_eq!(decoder.engine_decode_tokens_per_second(), Some(100.0));
+        decoder
+            .push(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"completion_tokens\":2,\"total_tokens\":39}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(decoder.engine_decode_tokens_per_second(), None);
+
+        let mut partial = SseDecoder::new();
+        partial
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_ms\":20.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(partial.completion_tokens(), Some(2));
+        assert_eq!(partial.engine_decode_tokens_per_second(), None);
+
+        let mut malformed = SseDecoder::new();
+        malformed
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":\"two\",\"predicted_ms\":20.0,",
+                    "\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(malformed.completion_tokens(), Some(2));
+        assert_eq!(malformed.engine_decode_tokens_per_second(), None);
+
+        let mut duplicate = SseDecoder::new();
+        duplicate
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_n\":2,",
+                    "\"predicted_ms\":20.0,\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(duplicate.engine_decode_tokens_per_second(), None);
+
+        let mut overflow = SseDecoder::new();
+        overflow
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,",
+                    "\"completion_tokens\":1,\"total_tokens\":2},",
+                    "\"timings\":{\"predicted_n\":1,\"predicted_ms\":1e-320,",
+                    "\"predicted_per_second\":1.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(overflow.completion_tokens(), Some(1));
+        assert_eq!(overflow.engine_decode_tokens_per_second(), None);
+    }
+
+    #[test]
+    fn changed_terminal_usage_is_rejected() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(
+            decoder
+                .push(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine changed its streaming usage"
+            ))
+        );
+    }
+
+    #[test]
+    fn finish_reasons_are_typed_and_cannot_change() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )
+            .unwrap();
+        assert_eq!(
+            decoder.finish_reason(),
+            Some(EngineFinishReason::OutputLimit)
+        );
+        assert_eq!(
+            decoder
+                .push(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine changed its streaming finish reason"
+            ))
+        );
+    }
+
+    #[test]
+    fn one_large_event_is_sliced_into_bounded_utf8_chunks() {
+        let content = "é".repeat(300_000);
+        let body = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let (chunks, generated_end, backing) = decode(&[body.as_bytes()]).unwrap();
+        assert_eq!(generated_end, content.len());
+        assert_eq!(chunks.concat(), content);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.capacity() <= MAX_SUFFIX_BYTES));
+        assert!(backing <= 3 * MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn uneven_events_keep_each_canonical_chunk_at_exact_capacity() {
+        let first = "a".repeat(40 * 1024);
+        let second = "b".repeat(24 * 1024);
+        let body = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{first}\"}}}}]}}\n\
+             \ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{second}\"}}}}]}}\n\
+             \ndata: [DONE]\n\n"
+        );
+        let (chunks, generated_end, _) = decode(&[body.as_bytes()]).unwrap();
+        assert_eq!(generated_end, MAX_SUFFIX_BYTES);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), MAX_SUFFIX_BYTES);
+        assert_eq!(chunks[0].capacity(), MAX_SUFFIX_BYTES);
+    }
+
+    #[test]
+    fn interrupted_large_event_keeps_every_observed_byte_drainable() {
+        let content = "é".repeat(300_000);
+        let body = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let first = decoder.push(body.as_bytes()).unwrap().chunk.unwrap();
+        let mut recovered = first;
+        while let Some(chunk) = decoder.take_remaining_chunk() {
+            assert!(chunk.capacity() <= MAX_SUFFIX_BYTES);
+            recovered.push_str(&chunk);
+        }
+        assert_eq!(recovered, content);
+        assert_eq!(decoder.generated_end(), recovered.len());
+    }
+
+    #[test]
+    fn terminal_requires_a_dispatched_event_and_errors_poison_the_decoder() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"data: [DONE]").unwrap();
+        assert_eq!(
+            decoder.finish().unwrap_err(),
+            DecodeError::InvalidStream("engine stream ended before its terminal event")
+        );
+
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder
+                .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"x\"}}]}\n\n")
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine returned an unexpected streaming choice"
+            ))
+        );
+        assert_eq!(
+            decoder.push(b"data: [DONE]\n\n").err(),
+            Some(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable"
+            ))
+        );
+    }
+
+    #[test]
+    fn terminal_event_ignores_same_frame_trailing_content_for_all_delimiters() {
+        for delimiter in ["\n\n", "\r\r", "\r\n\r\n"] {
+            let body = format!(
+                "data: [DONE]{delimiter}data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"BAD\"}}}}]}}\n\n"
+            );
+            let mut decoder = SseDecoder::new();
+            let step = decoder.push(body.as_bytes()).unwrap();
+            assert!(step.done);
+            assert!(step.chunk.is_none());
+            assert_eq!(decoder.generated_end(), 0);
+            assert!(
+                decoder
+                    .push(&body.as_bytes()[step.consumed..])
+                    .unwrap()
+                    .done
+            );
+            assert_eq!(decoder.generated_end(), 0);
+        }
+    }
+
+    #[test]
+    fn split_crlf_terminal_consumes_no_following_event() {
+        let mut decoder = SseDecoder::new();
+        assert!(!decoder.push(b"data: [DONE]\r").unwrap().done);
+        let trailing = b"\n\r\ndata: {broken}\r\n\r\n";
+        let step = decoder.push(trailing).unwrap();
+        assert!(step.done);
+        assert_eq!(decoder.generated_end(), 0);
+        assert!(decoder.push(&trailing[step.consumed..]).unwrap().done);
+    }
+
+    #[test]
+    fn multiple_choices_and_large_engine_errors_fail_without_retaining_messages() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.push(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{}},{\"index\":1,\"delta\":{}}]}\n\n"
+            ).err(),
+            Some(DecodeError::InvalidStream("engine returned malformed streaming JSON"))
+        );
+
+        let message = "x".repeat(MAX_EVENT_BYTES / 2);
+        let event = format!("data: {{\"choices\":[],\"error\":{{\"message\":\"{message}\"}}}}\n\n");
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.push(event.as_bytes()).err(),
+            Some(DecodeError::InvalidStream(
+                "engine reported a generation failure"
+            ))
+        );
+        assert!(decoder.retained_backing_bytes() <= 3 * MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn crlf_comments_count_toward_the_raw_event_limit() {
+        let comments = ":\r\n".repeat(MAX_EVENT_BYTES / 3 + 1);
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.push(comments.as_bytes()).err(),
+            Some(DecodeError::EventLimit)
+        );
+    }
+
+    #[test]
+    fn event_and_total_output_limits_fail_at_the_boundary() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(&vec![b'x'; MAX_EVENT_BYTES]).is_ok());
+        assert_eq!(decoder.push(b"x").err(), Some(DecodeError::EventLimit));
+
+        let mut decoder = SseDecoder::new();
+        decoder.generated_end = MAX_OUTPUT_BYTES;
+        assert_eq!(
+            decoder
+                .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")
+                .err(),
+            Some(DecodeError::OutputLimit)
+        );
+    }
+}

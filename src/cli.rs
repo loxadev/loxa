@@ -74,8 +74,8 @@ pub enum ServiceDevCommand {
     Chat {
         /// Exact installed model ID currently loaded by the service.
         model_id: String,
-        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
-        max_tokens: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
+        max_tokens: Option<u32>,
         #[command(flatten)]
         target: ServiceTargetArgs,
     },
@@ -576,6 +576,35 @@ mod tests {
             PathBuf::from("/private/tmp/loxa-service-dev")
         );
         assert!(matches!(args.command, ServiceDevCommand::Status));
+    }
+
+    #[test]
+    fn service_chat_omits_local_output_limit_unless_requested() {
+        let base = [
+            "loxa",
+            "service-dev",
+            "--data-root",
+            "/private/tmp/loxa-test",
+            "chat",
+            "demo",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::ServiceDev(args) = cli.command else {
+            panic!("expected service development command")
+        };
+        let ServiceDevCommand::Chat { max_tokens, .. } = args.command else {
+            panic!("expected service chat")
+        };
+        assert_eq!(max_tokens, None);
+
+        let cli = Cli::try_parse_from(base.into_iter().chain(["--max-tokens", "7"])).unwrap();
+        let Command::ServiceDev(args) = cli.command else {
+            panic!("expected service development command")
+        };
+        let ServiceDevCommand::Chat { max_tokens, .. } = args.command else {
+            panic!("expected service chat")
+        };
+        assert_eq!(max_tokens, Some(7));
     }
 
     #[test]

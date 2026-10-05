@@ -8,6 +8,7 @@ use crate::runner::{
 use crate::runtime::RuntimeOwnership;
 use crate::service::intent::{self, LaunchIntent};
 use loxa_ipc::{Accepted, ErrorCategory, ServiceError};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
@@ -84,6 +85,10 @@ impl RuntimeWorker<'_> {
                 Ok(OwnerCommand::Wake) => {}
                 #[cfg(test)]
                 Ok(OwnerCommand::PanicForTest) => panic!("injected runtime owner failure"),
+                #[cfg(all(test, target_os = "macos"))]
+                Ok(OwnerCommand::QueueProbeForTest(completion)) => {
+                    let _ = completion.try_send(());
+                }
                 // No control handles remain, and recv only runs between operations.
                 Err(mpsc::RecvError) => return,
             }
@@ -98,14 +103,23 @@ impl RuntimeWorker<'_> {
         &mut self,
         operation: Arc<OperationControl>,
         config: crate::config::Config,
-        accepted: oneshot::Sender<Result<Accepted, ServiceError>>,
+        accepted: Option<oneshot::Sender<Result<Accepted, ServiceError>>>,
     ) {
-        if self.cancellation_requested(&operation) {
-            self.shared.state().complete(&operation, None);
-            let _ = accepted.send(Err(ServiceError::new(
-                ErrorCategory::ServiceUnavailable,
-                "service began draining before the load was admitted",
-            )));
+        #[cfg(all(test, target_os = "macos"))]
+        self.runtime_handle
+            .block_on(super::native_test_gate::pause_once(
+                &self.shared.native_reload_launch_gate,
+            ));
+        if self.cancellation_requested(&operation)
+            || !self.shared.state().launch_is_current(&operation)
+        {
+            self.complete(&operation, None);
+            if let Some(accepted) = accepted {
+                let _ = accepted.send(Err(ServiceError::new(
+                    ErrorCategory::ServiceUnavailable,
+                    "service began draining before the load was admitted",
+                )));
+            }
             return;
         }
         let launch_intent = match LaunchIntent::new(
@@ -118,29 +132,37 @@ impl RuntimeWorker<'_> {
         ) {
             Ok(intent) => intent,
             Err(error) => {
-                self.shared.state().complete(&operation, None);
-                let _ = accepted.send(Err(ServiceError::new(ErrorCategory::Internal, error)));
+                self.complete(&operation, None);
+                if let Some(accepted) = accepted {
+                    let _ = accepted.send(Err(ServiceError::new(ErrorCategory::Internal, error)));
+                }
                 return;
             }
         };
         if let Err(error) = intent::publish(&self.control_dir, &launch_intent) {
             self.shared.state().require_recovery(&operation, &error);
-            let _ = accepted.send(Err(ServiceError::new(
-                ErrorCategory::RecoveryRequired,
-                error,
-            )));
+            if let Some(accepted) = accepted {
+                let _ = accepted.send(Err(ServiceError::new(
+                    ErrorCategory::RecoveryRequired,
+                    error,
+                )));
+            }
             return;
         }
         let accepted_start = self.shared.state().accept_start(&operation);
         let Some(starting) = accepted_start else {
-            let _ = accepted.send(Err(ServiceError::new(
-                ErrorCategory::ServiceUnavailable,
-                "service began draining before the load was admitted",
-            )));
+            if let Some(accepted) = accepted {
+                let _ = accepted.send(Err(ServiceError::new(
+                    ErrorCategory::ServiceUnavailable,
+                    "service began draining before the load was admitted",
+                )));
+            }
             self.finish_without_server(operation, launch_intent, None);
             return;
         };
-        let _ = accepted.send(Ok(starting));
+        if let Some(accepted) = accepted {
+            let _ = accepted.send(Ok(starting));
+        }
 
         let result = resolve_manifest(&self.paths, &operation.model_id)
             .map_err(crate::runnable::ManagedRunnableError::ModelUnavailable)
@@ -182,9 +204,18 @@ impl RuntimeWorker<'_> {
         if self.retained_runtime.is_none() && self.paths.runtime_identity.is_bundled() {
             self.retained_runtime = runnable.managed_runtime().cloned();
         }
-        let endpoint = self
-            .control_dir
-            .join(format!("engine-{:016x}.sock", operation.generation));
+        let endpoint = match private_engine_endpoint(&self.control_dir, operation.generation) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.finish_without_server(
+                    operation,
+                    launch_intent,
+                    Some(ErrorCategory::StartupFailed),
+                );
+                tracing::warn!(event = "service_engine_endpoint_failed", failure = %error);
+                return;
+            }
+        };
         let started = crate::runner::start_service_with_ownership(
             runnable,
             self.ownership,
@@ -199,11 +230,26 @@ impl RuntimeWorker<'_> {
                     return;
                 };
                 let fingerprint = Arc::new(server.fingerprint().clone());
+                let observed_context = if self.cancellation_requested(&operation) {
+                    None
+                } else {
+                    crate::runner::service_transport::observe_context(
+                        &self.runtime_handle,
+                        &endpoint,
+                        pid,
+                        &operation.model_id,
+                    )
+                    .filter(|context| crate::runnable::service_context_is_supported(*context))
+                };
                 let ready = self.shared.state().advance(
                     &operation,
                     OperationPhase::Ready {
-                        engine_pid: pid,
+                        engine: super::state::EngineDescriptor {
+                            pid,
+                            endpoint: Arc::new(endpoint),
+                        },
                         fingerprint,
+                        observed_context,
                     },
                 );
                 if ready {
@@ -238,11 +284,18 @@ impl RuntimeWorker<'_> {
             }
             match server.poll() {
                 Ok(Some(_)) => {
+                    self.shared
+                        .state()
+                        .cancel_generation_for_engine_failure(&operation);
+                    self.shared.state().engine_gone(&operation);
                     self.finish_without_server(operation, launch_intent, None);
                     return;
                 }
                 Ok(None) => std::thread::sleep(OWNER_POLL_INTERVAL),
                 Err(_) => {
+                    self.shared
+                        .state()
+                        .cancel_generation_for_engine_failure(&operation);
                     self.stop_and_finish(operation, launch_intent, server);
                     return;
                 }
@@ -257,7 +310,8 @@ impl RuntimeWorker<'_> {
         mut server: PersistentServer,
     ) {
         let attempted_through = operation.retry_cleanup.load(Ordering::Acquire);
-        if server.terminate().is_ok() {
+        if self.terminate(&mut server).is_ok() {
+            self.shared.state().engine_gone(&operation);
             self.finish_without_server(operation, launch_intent, None);
         } else {
             self.manage_cleanup_failed(operation, launch_intent, server, attempted_through);
@@ -278,7 +332,8 @@ impl RuntimeWorker<'_> {
             let requested_through = operation.retry_cleanup.load(Ordering::Acquire);
             if requested_through != attempted_through {
                 attempted_through = requested_through;
-                if server.terminate().is_ok() {
+                if self.terminate(&mut server).is_ok() {
+                    self.shared.state().engine_gone(&operation);
                     self.finish_without_server(operation, launch_intent, None);
                     return;
                 }
@@ -306,8 +361,11 @@ impl RuntimeWorker<'_> {
         let mut attempted_through = operation.retry_cleanup.load(Ordering::Acquire);
         let mut clear_progress = intent::ClearProgress::default();
         loop {
-            if intent::clear(&self.control_dir, &launch_intent, &mut clear_progress).is_ok() {
-                self.shared.state().complete(&operation, failure);
+            if self
+                .clear_intent(&launch_intent, &mut clear_progress)
+                .is_ok()
+            {
+                self.complete(&operation, failure);
                 return;
             }
             self.shared
@@ -323,6 +381,58 @@ impl RuntimeWorker<'_> {
             }
         }
     }
+
+    fn complete(&self, operation: &Arc<OperationControl>, failure: Option<ErrorCategory>) {
+        if self.shared.state().complete(operation, failure) {
+            super::history::maybe_begin_history_drain(&self.shared);
+        }
+    }
+
+    fn terminate(&self, server: &mut PersistentServer) -> Result<(), String> {
+        #[cfg(all(test, target_os = "macos"))]
+        if self
+            .shared
+            .fail_next_runtime_termination
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err("injected runtime termination failure".into());
+        }
+        server.terminate()
+    }
+
+    fn clear_intent(
+        &self,
+        launch_intent: &LaunchIntent,
+        progress: &mut intent::ClearProgress,
+    ) -> Result<(), String> {
+        #[cfg(all(test, target_os = "macos"))]
+        if self
+            .shared
+            .fail_next_intent_clear
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err("injected launch-intent clear failure".into());
+        }
+        intent::clear(&self.control_dir, launch_intent, progress)
+    }
+}
+
+fn private_engine_endpoint(
+    control_dir: &std::path::Path,
+    generation: u64,
+) -> Result<PathBuf, String> {
+    let mut nonce = [0_u8; loxa_ipc::ENGINE_SOCKET_NONCE_BYTES];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut nonce))
+        .map_err(|error| format!("could not create private engine endpoint identity: {error}"))?;
+    let mut suffix = String::with_capacity(loxa_ipc::ENGINE_SOCKET_NONCE_BYTES * 2);
+    for byte in nonce {
+        use std::fmt::Write as _;
+        write!(&mut suffix, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    let filename = format!("engine-{generation:016x}-{suffix}.sock");
+    debug_assert_eq!(filename.len(), loxa_ipc::ENGINE_SOCKET_FILENAME_BYTES);
+    Ok(control_dir.join(filename))
 }
 
 fn resolve_manifest(paths: &AppPaths, model_id: &str) -> Result<Manifest, String> {

@@ -36,7 +36,7 @@ pub(super) fn next_updated_ms(previous: i64) -> Result<i64, HistoryError> {
     }
 }
 
-pub(super) fn parse_revision(value: &str) -> Result<i64, HistoryError> {
+pub(crate) fn parse_revision(value: &str) -> Result<i64, HistoryError> {
     let revision = parse_nonnegative(value, "invalid conversation revision")?;
     if revision == 0 {
         return Err(HistoryError::new(
@@ -60,7 +60,7 @@ pub(super) fn parse_nonnegative(value: &str, context: &'static str) -> Result<i6
         .map_err(|_| HistoryError::new(HistoryErrorKind::InvalidInput, context))
 }
 
-pub(super) fn decode_id(value: &str) -> Result<[u8; 16], HistoryError> {
+pub(crate) fn decode_id(value: &str) -> Result<[u8; 16], HistoryError> {
     if value.len() != 32 {
         return Err(HistoryError::new(
             HistoryErrorKind::InvalidInput,
@@ -74,7 +74,7 @@ pub(super) fn decode_id(value: &str) -> Result<[u8; 16], HistoryError> {
     Ok(bytes)
 }
 
-pub(super) fn encode_id(value: [u8; 16]) -> String {
+pub(crate) fn encode_id(value: [u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(32);
     for byte in value {
