@@ -10,9 +10,10 @@ mod platform;
 mod protocol;
 
 pub use bootstrap::{
-    initialize_development_root, ClientBootstrap, DevelopmentInstanceLock, DevelopmentRoot,
-    OriginRecord, DEVELOPMENT_MARKER_FILENAME, ENGINE_SOCKET_FILENAME_BYTES,
-    ENGINE_SOCKET_NONCE_BYTES,
+    initialize_development_root, initialize_user_root, ClientBootstrap, DevelopmentInstanceLock,
+    DevelopmentRoot, OriginRecord, PrivateUserRoot, RootMode, RootPermissionRepair, ServiceRoot,
+    UserRootError, UserRootInspection, DEVELOPMENT_MARKER_FILENAME, ENGINE_SOCKET_FILENAME_BYTES,
+    ENGINE_SOCKET_NONCE_BYTES, USER_SERVICE_MARKER_FILENAME,
 };
 pub use client::{
     ClientError, ConnectMode, GenerationSubscription, PendingGenerationRequest, ServiceClient,

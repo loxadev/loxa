@@ -1,4 +1,4 @@
-use crate::bootstrap::ClientBootstrap;
+use crate::bootstrap::{ClientBootstrap, RootMode};
 use crate::codec::{
     decode_with_limit, encode_with_limit, framed, set_frame_limit, MAX_FRAME_BYTES,
     MAX_HISTORY_FRAME_BYTES,
@@ -90,6 +90,35 @@ impl ServiceClient {
         let forbidden_root = forbidden_root.map(Path::to_path_buf);
         let client_build = client_build.into();
         run_bootstrap(move || Self::load(&data_root, forbidden_root.as_deref(), client_build)).await
+    }
+
+    pub fn from_bootstrap(
+        bootstrap: ClientBootstrap,
+        client_build: impl Into<String>,
+    ) -> Result<Self, String> {
+        let client_build = client_build.into();
+        if client_build.is_empty() || client_build.len() > crate::protocol::MAX_BUILD_BYTES {
+            return Err("invalid client build identity".into());
+        }
+        bootstrap.root().validate_current()?;
+        bootstrap.origin().validate_current()?;
+        Ok(Self {
+            bootstrap,
+            client_build,
+        })
+    }
+
+    pub fn load_user(data_root: &Path, client_build: impl Into<String>) -> Result<Self, String> {
+        Self::from_bootstrap(ClientBootstrap::load_user(data_root)?, client_build)
+    }
+
+    pub async fn load_user_async(
+        data_root: &Path,
+        client_build: impl Into<String>,
+    ) -> Result<Self, String> {
+        let data_root = data_root.to_path_buf();
+        let client_build = client_build.into();
+        run_bootstrap(move || Self::load_user(&data_root, client_build)).await
     }
 
     pub fn bootstrap(&self) -> &ClientBootstrap {
@@ -548,6 +577,12 @@ impl ServiceClient {
     }
 
     async fn connect_once(&self, contract: ClientContract) -> Result<Connection, ClientError> {
+        if self.bootstrap.root().mode() == RootMode::User {
+            self.bootstrap
+                .root()
+                .validate_current()
+                .map_err(ClientError::Transport)?;
+        }
         validate_socket_path(self.bootstrap.root().socket_path())?;
         let stream = match timeout(
             CONNECT_TIMEOUT,
@@ -571,6 +606,12 @@ impl ServiceClient {
         self.bootstrap
             .validate_peer(peer)
             .map_err(ClientError::Transport)?;
+        if self.bootstrap.root().mode() == RootMode::User {
+            self.bootstrap
+                .root()
+                .validate_current()
+                .map_err(ClientError::Transport)?;
+        }
         let mut framed = framed(stream);
         let requested_hello = match contract {
             ClientContract::Legacy => Hello::current(

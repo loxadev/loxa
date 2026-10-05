@@ -253,6 +253,82 @@ pub(super) struct ForegroundLock {
 }
 
 impl ForegroundLock {
+    #[cfg(unix)]
+    pub(super) fn acquire_service_at(
+        directory: &File,
+        path: &Path,
+    ) -> Result<Self, ForegroundLockAcquireError> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let local_lock =
+            LocalForegroundLock::reserve(path).map_err(map_local_foreground_lock_error)?;
+        // SAFETY: the retained directory is live and the static filename is NUL terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"foreground.lock".as_ptr(),
+                libc::O_CREAT
+                    | libc::O_RDWR
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if descriptor == -1 {
+            return Err(ForegroundLockAcquireError::Error(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: openat returned a newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_lock_file(&file, path).map_err(ForegroundLockAcquireError::Error)?;
+        let opened = file
+            .metadata()
+            .map_err(|error| ForegroundLockAcquireError::Error(error.to_string()))?;
+        // SAFETY: geteuid has no preconditions.
+        if opened.uid() != unsafe { libc::geteuid() } || opened.mode() & 0o022 != 0 {
+            return Err(ForegroundLockAcquireError::Error(
+                "unsafe service runtime lock".into(),
+            ));
+        }
+        let lock = Self::finish_acquisition(
+            path,
+            file,
+            local_lock,
+            ForegroundLockMode::OpenFileDescriptionOnly,
+            ForegroundLockTestHook::none(),
+        )?;
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained directory and output storage remain live.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c"foreground.lock".as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(ForegroundLockAcquireError::Error(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: fstatat initialized the complete stat on success.
+        let current = unsafe { current.assume_init() };
+        // Darwin and Linux use different stat integer widths for these identities.
+        #[allow(clippy::unnecessary_cast)]
+        let matches =
+            current.st_dev as u64 == opened.dev() && current.st_ino as u64 == opened.ino();
+        if !matches {
+            return Err(ForegroundLockAcquireError::Error(
+                "service runtime lock identity changed".into(),
+            ));
+        }
+        Ok(lock)
+    }
+
     pub(super) fn acquire_service(path: &Path) -> Result<Self, ForegroundLockAcquireError> {
         #[cfg(unix)]
         {
@@ -340,9 +416,20 @@ impl ForegroundLock {
         mode: ForegroundLockMode,
         test_hook: ForegroundLockTestHook,
     ) -> Result<Self, ForegroundLockAcquireError> {
-        let mut local_lock =
+        let local_lock =
             LocalForegroundLock::reserve(path).map_err(map_local_foreground_lock_error)?;
         let file = open_lock(path).map_err(ForegroundLockAcquireError::Error)?;
+        Self::finish_acquisition(path, file, local_lock, mode, test_hook)
+    }
+
+    #[cfg(unix)]
+    fn finish_acquisition(
+        path: &Path,
+        file: File,
+        mut local_lock: LocalForegroundLock,
+        mode: ForegroundLockMode,
+        test_hook: ForegroundLockTestHook,
+    ) -> Result<Self, ForegroundLockAcquireError> {
         local_lock
             .bind_to_file(&file)
             .map_err(map_local_foreground_lock_error)?;
@@ -400,6 +487,11 @@ pub(super) fn open_lock(path: &Path) -> Result<File, String> {
     let file = options
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
+    validate_lock_file(&file, path)?;
+    Ok(file)
+}
+
+fn validate_lock_file(file: &File, path: &Path) -> Result<(), String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -413,5 +505,5 @@ pub(super) fn open_lock(path: &Path) -> Result<File, String> {
             return Err(format!("unsafe runtime lock {}", path.display()));
         }
     }
-    Ok(file)
+    Ok(())
 }

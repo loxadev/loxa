@@ -5,7 +5,10 @@ mod intent;
 mod server;
 
 use coordinator::Coordinator;
-use loxa_ipc::{ClientBootstrap, ConnectMode, ReplyOutcome, ServiceClient, ServiceCommand};
+use loxa_ipc::{
+    ClientBootstrap, ConnectMode, PrivateUserRoot, ReplyOutcome, RootMode, ServiceClient,
+    ServiceCommand,
+};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,20 +48,24 @@ pub fn run_hidden_from_env() -> HiddenServiceResult {
     if command != "__service-launch" && command != "__service-serve" {
         return HiddenServiceResult::NotServiceCommand;
     }
-    let result = parse_hidden_invocation(arguments.collect()).and_then(|(root, root_identity)| {
-        if command == "__service-launch" {
-            launch_detached(&root, &root_identity)
-        } else {
-            serve(&root, &root_identity)
-        }
-    });
+    let result =
+        parse_hidden_invocation(arguments.collect()).and_then(|(mode, root, root_identity)| {
+            if command == "__service-launch" {
+                launch_detached(mode, &root, &root_identity)
+            } else {
+                serve(mode, &root, &root_identity)
+            }
+        });
     HiddenServiceResult::Exit(result)
 }
 
-fn parse_hidden_invocation(arguments: Vec<OsString>) -> Result<(PathBuf, String), String> {
+fn parse_hidden_invocation(
+    arguments: Vec<OsString>,
+) -> Result<(RootMode, PathBuf, String), String> {
     match arguments.as_slice() {
-        [root_flag, root, identity_flag, root_identity]
-            if root_flag == "--data-root"
+        [mode_flag, mode, root_flag, root, identity_flag, root_identity]
+            if mode_flag == "--root-mode"
+                && root_flag == "--data-root"
                 && !root.is_empty()
                 && identity_flag == "--root-identity"
                 && !root_identity.is_empty() =>
@@ -66,10 +73,30 @@ fn parse_hidden_invocation(arguments: Vec<OsString>) -> Result<(PathBuf, String)
             let root_identity = root_identity
                 .to_str()
                 .ok_or_else(|| "invalid internal service invocation".to_string())?;
-            Ok((PathBuf::from(root), root_identity.to_owned()))
+            let mode = match mode.to_str() {
+                Some("development") => RootMode::Development,
+                Some("user") => RootMode::User,
+                _ => return Err("invalid internal service root mode".into()),
+            };
+            Ok((mode, PathBuf::from(root), root_identity.to_owned()))
         }
         _ => Err("invalid internal service invocation".into()),
     }
+}
+
+pub fn initialize_user_root(root: PrivateUserRoot) -> Result<ClientBootstrap, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    initialize_user_root_from(root, &executable)
+}
+
+pub fn initialize_user_root_from(
+    root: PrivateUserRoot,
+    executable: &Path,
+) -> Result<ClientBootstrap, String> {
+    if !executable.is_absolute() {
+        return Err("service user origin must be absolute".into());
+    }
+    loxa_ipc::initialize_user_root(root, executable, BUILD_ID)
 }
 
 pub fn initialize_development_root(root: &Path) -> Result<ClientBootstrap, String> {
@@ -101,16 +128,34 @@ pub async fn development_request(
         .map_err(|error| error.to_string())
 }
 
-fn launch_detached(root: &Path, expected_root_identity: &str) -> Result<i32, String> {
-    let normal = crate::paths::AppPaths::from_env()?;
-    let bootstrap =
-        ClientBootstrap::load_expected(root, Some(&normal.root), expected_root_identity)?;
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    close_inherited_descriptors()?;
+fn load_hidden_bootstrap(
+    mode: RootMode,
+    root: &Path,
+    expected_root_identity: &str,
+) -> Result<ClientBootstrap, String> {
+    let bootstrap = match mode {
+        RootMode::Development => {
+            let normal = crate::paths::AppPaths::from_env()?;
+            ClientBootstrap::load_expected(root, Some(&normal.root), expected_root_identity)?
+        }
+        RootMode::User => ClientBootstrap::load_user_expected(root, expected_root_identity)?,
+    };
+    bootstrap.validate_current_process()?;
+    Ok(bootstrap)
+}
+
+fn launch_detached(
+    mode: RootMode,
+    root: &Path,
+    expected_root_identity: &str,
+) -> Result<i32, String> {
+    let bootstrap = load_launch_bootstrap(mode, root, expected_root_identity)?;
     bootstrap.root().validate_current()?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(bootstrap.origin().executable());
     command
         .arg("__service-serve")
+        .arg("--root-mode")
+        .arg(mode.as_str())
         .arg("--data-root")
         .arg(root)
         .arg("--root-identity")
@@ -137,6 +182,16 @@ fn launch_detached(root: &Path, expected_root_identity: &str) -> Result<i32, Str
         .spawn()
         .map_err(|error| format!("could not detach Loxa background service: {error}"))?;
     Ok(0)
+}
+
+fn load_launch_bootstrap(
+    mode: RootMode,
+    root: &Path,
+    expected_root_identity: &str,
+) -> Result<ClientBootstrap, String> {
+    // Close only inherited descriptors, before loading our retained root handles.
+    close_inherited_descriptors()?;
+    load_hidden_bootstrap(mode, root, expected_root_identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -194,24 +249,26 @@ fn close_inherited_descriptors_from(directory: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn serve(root: &Path, expected_root_identity: &str) -> Result<i32, String> {
+fn serve(mode: RootMode, root: &Path, expected_root_identity: &str) -> Result<i32, String> {
     // Service startup precedes runtime threads, so this process-wide setting is
     // deterministic for the control socket and engine descendants.
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
     }
-    let normal = crate::paths::AppPaths::from_env()?;
-    let bootstrap =
-        ClientBootstrap::load_expected(root, Some(&normal.root), expected_root_identity)?;
-    bootstrap.origin().validate_current()?;
+    let bootstrap = load_hidden_bootstrap(mode, root, expected_root_identity)?;
     let _instance = bootstrap.root().acquire_instance()?;
     bootstrap.root().validate_current()?;
     let (machine_boot_id, boot_epoch) = intent::boot_evidence(bootstrap.root().root_identity())?;
-    let ownership = crate::runtime::RuntimeOwnership::acquire_service_unreconciled(
-        &bootstrap.root().root().join("run"),
-    )
+    let run_path = bootstrap.root().root().join("run");
+    let ownership = match bootstrap.root().run_directory() {
+        Some(directory) => {
+            crate::runtime::RuntimeOwnership::acquire_service_unreconciled_at(directory, &run_path)
+        }
+        None => crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&run_path),
+    }
     .map_err(runtime_owner_error)?;
+    bootstrap.root().validate_current()?;
     let initial_recovery = intent::audit_retained(
         bootstrap.root().control_dir(),
         bootstrap.root().root_identity(),
@@ -274,8 +331,11 @@ fn serve(root: &Path, expected_root_identity: &str) -> Result<i32, String> {
 fn runtime_owner_error(error: crate::runtime::RuntimeOwnershipAcquireError) -> String {
     match error {
         crate::runtime::RuntimeOwnershipAcquireError::Conflict => {
-            "another Loxa runtime owns the development root".into()
+            "another Loxa runtime owns this data root".into()
         }
         crate::runtime::RuntimeOwnershipAcquireError::Failed(message) => message,
     }
 }
+
+#[cfg(test)]
+mod tests;

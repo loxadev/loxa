@@ -68,6 +68,17 @@ impl RuntimeOwnershipAcquireError {
 }
 
 impl RuntimeOwnership {
+    #[cfg(unix)]
+    pub(crate) fn acquire_service_unreconciled_at(
+        directory: &std::fs::File,
+        run_dir: &Path,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        let _operation =
+            lock_local_foreground_operation().map_err(RuntimeOwnershipAcquireError::Failed)?;
+        let lock = ForegroundLock::acquire_service_at(directory, &run_dir.join("foreground.lock"));
+        Self::from_foreground_lock(run_dir, lock)
+    }
+
     pub(crate) fn acquire(run_dir: &Path) -> Result<Self, String> {
         Self::acquire_with_lock(run_dir, ForegroundLock::acquire)
     }
@@ -145,7 +156,14 @@ impl RuntimeOwnership {
         acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
     ) -> Result<Self, RuntimeOwnershipAcquireError> {
         let lock_path = run_dir.join("foreground.lock");
-        let foreground_lock = acquire_lock(&lock_path).map_err(|error| match error {
+        Self::from_foreground_lock(run_dir, acquire_lock(&lock_path))
+    }
+
+    fn from_foreground_lock(
+        run_dir: &Path,
+        lock: Result<ForegroundLock, ForegroundLockAcquireError>,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        let foreground_lock = lock.map_err(|error| match error {
             ForegroundLockAcquireError::WouldBlock => RuntimeOwnershipAcquireError::Conflict,
             ForegroundLockAcquireError::Error(error) => RuntimeOwnershipAcquireError::Failed(error),
         })?;
